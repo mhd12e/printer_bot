@@ -30,6 +30,54 @@ warn()    { echo -e "${YELLOW}${BOLD}!${NC} $*"; }
 error()   { echo -e "${RED}${BOLD}✗${NC} $*" >&2; }
 step()    { echo -e "${BLUE}${BOLD}[$1/$2]${NC} $3"; }
 
+# ── Rollback system ──────────────────────────────────────────────
+# Push undo commands onto a stack. On ERR, they execute in reverse.
+# Usage:
+#   _rollback_enable
+#   _rollback_push "rm -rf /some/dir"
+#   _rollback_push "systemctl stop foo"
+#   ... if anything fails, both run in reverse order ...
+#   _rollback_disable   # success — disarm the trap
+
+_ROLLBACK_STACK=()
+_ROLLBACK_ACTIVE=false
+
+_rollback_push() {
+    _ROLLBACK_STACK+=("$1")
+}
+
+_rollback_run() {
+    if [ "$_ROLLBACK_ACTIVE" != true ]; then
+        return
+    fi
+    echo ""
+    error "Something went wrong. Rolling back..."
+    echo ""
+
+    local i
+    for (( i=${#_ROLLBACK_STACK[@]}-1; i>=0; i-- )); do
+        local cmd="${_ROLLBACK_STACK[$i]}"
+        echo -e "  ${DIM}undo: $cmd${NC}"
+        eval "$cmd" 2>/dev/null || true
+    done
+
+    echo ""
+    error "Rolled back to previous state. Fix the issue and try again."
+    exit 1
+}
+
+_rollback_enable() {
+    _ROLLBACK_STACK=()
+    _ROLLBACK_ACTIVE=true
+    trap _rollback_run ERR
+}
+
+_rollback_disable() {
+    _ROLLBACK_ACTIVE=false
+    _ROLLBACK_STACK=()
+    trap - ERR
+}
+
 # ── Help system ───────────────────────────────────────────────────
 # Every command calls this at the top. If -h or --help is in args,
 # it prints help and exits. Otherwise continues.
@@ -356,6 +404,9 @@ cmd_install() {
     echo -e "${BOLD}PrintBot Installer${NC}"
     echo ""
 
+    _rollback_enable
+
+    # Step 1: System packages (idempotent — no rollback needed)
     step 1 7 "Installing system packages..."
     apt update -qq
     apt install -y -qq \
@@ -367,11 +418,13 @@ cmd_install() {
         gcc > /dev/null
     success "System packages installed."
 
+    # Step 2: CUPS (idempotent — no rollback needed)
     step 2 7 "Configuring CUPS..."
     systemctl enable --now cups > /dev/null 2>&1
     usermod -aG lpadmin "$SUDO_USER"
     success "CUPS configured."
 
+    # Step 3: Printer (interactive — errors here are not fatal)
     step 3 7 "Setting up printer..."
     if lpstat -p 2>/dev/null | grep -qi "hp"; then
         echo "  HP printer already detected:"
@@ -386,17 +439,21 @@ cmd_install() {
     if [[ "${SKIP_PRINTER,,}" != "y" ]]; then
         echo "  Connect the printer via USB now, then press Enter."
         read -r
-        hp-setup -i
-        lpstat -p 2>/dev/null | sed 's/^/    /'
+        hp-setup -i || warn "Printer setup had issues. You can retry later: sudo printbot printer setup"
+        lpstat -p 2>/dev/null | sed 's/^/    /' || true
     fi
     success "Printer configured."
 
+    # Step 4: Python venv
     step 4 7 "Setting up Python environment..."
     python3 -m venv "$VENV_DIR"
+    _rollback_push "rm -rf '$VENV_DIR'"
+
     "$VENV_DIR/bin/pip" install --upgrade pip -q
     "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" -q
     success "Python packages installed."
 
+    # Step 5: Config
     step 5 7 "Configuring bot..."
     local detected_printer
     detected_printer=$(lpstat -p 2>/dev/null | head -1 | awk '{print $2}' || echo "HP_Smart_Tank_725")
@@ -421,9 +478,11 @@ cmd_install() {
         [ -n "${GEMINI_KEY:-}" ] && echo "GEMINI_API_KEY=$GEMINI_KEY"
     } > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
+    _rollback_push "rm -f '$ENV_FILE'"
 
     # Create .users with labels
     touch "$USERS_FILE"
+    _rollback_push "rm -f '$USERS_FILE'"
     echo ""
     info "Name your users (optional, for 'printbot user list')"
     IFS=',' read -ra id_arr <<< "$USER_IDS"
@@ -438,17 +497,27 @@ cmd_install() {
 
     success ".env created."
 
+    # Step 6: Temp dir
     step 6 7 "Creating temp directory..."
     mkdir -p /tmp/printbot
     success "Done."
 
+    # Step 7: Service + CLI
     step 7 7 "Installing service and CLI..."
     _install_service
+    _rollback_push "systemctl stop '$SERVICE_NAME' 2>/dev/null; systemctl disable '$SERVICE_NAME' 2>/dev/null; rm -f '/etc/systemd/system/${SERVICE_NAME}.service'; systemctl daemon-reload"
+
     ln -sf "$BOT_DIR/printbot" "$CLI_LINK"
+    _rollback_push "rm -f '$CLI_LINK'"
+
     chmod +x "$BOT_DIR/printbot"
     _set_version
+    _rollback_push "rm -f '$VERSION_FILE'"
+
     systemctl start "$SERVICE_NAME"
-    success "Service started."
+
+    # All done — disarm rollback
+    _rollback_disable
 
     echo ""
     echo -e "${GREEN}${BOLD}Installation complete!${NC}"
@@ -477,9 +546,16 @@ cmd_update() {
     echo -e "${BOLD}Updating PrintBot...${NC}"
     echo ""
 
+    _rollback_enable
+
+    # Save current state for rollback
+    local OLD_COMMIT=""
+
     if [ -d "$BOT_DIR/.git" ]; then
         info "Pulling latest code..."
         cd "$BOT_DIR"
+        OLD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+
         git fetch origin 2>/dev/null || true
         local LOCAL REMOTE
         LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "none")
@@ -489,7 +565,14 @@ cmd_update() {
             git pull origin main
             success "Code updated."
 
+            if [ -n "$OLD_COMMIT" ]; then
+                _rollback_push "git -C '$BOT_DIR' reset --hard '$OLD_COMMIT'"
+            fi
+
+            # Re-exec if printbot script itself changed
             if git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -q "^printbot$"; then
+                # Disarm before re-exec — the new script will set its own trap
+                _rollback_disable
                 info "CLI tool updated. Re-running..."
                 exec "$BOT_DIR/printbot" update
             fi
@@ -498,16 +581,32 @@ cmd_update() {
         fi
     fi
 
+    # Backup venv before updating (just track for rollback message)
     info "Updating Python packages..."
     "$VENV_DIR/bin/pip" install --upgrade pip -q
     "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" --upgrade -q
     success "Packages updated."
+
+    # If pip broke something, rollback should revert code (pip will match old requirements.txt)
+    if [ -n "$OLD_COMMIT" ]; then
+        _rollback_push "'$VENV_DIR/bin/pip' install -r '$BOT_DIR/requirements.txt' -q 2>/dev/null || true"
+    fi
 
     _run_migrations
     _install_service
 
     systemctl restart "$SERVICE_NAME"
     success "Service restarted."
+
+    # Verify the service actually started
+    sleep 2
+    if ! _is_running; then
+        error "Service failed to start after update."
+        # Trigger rollback
+        false
+    fi
+
+    _rollback_disable
 
     echo ""
     echo -e "${GREEN}${BOLD}Update complete!${NC}"

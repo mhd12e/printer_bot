@@ -7,7 +7,6 @@ set -euo pipefail
 REPO="https://github.com/mhd12e/printbot.git"
 INSTALL_DIR="$HOME/printbot"
 
-# If run via sudo, install to the calling user's home
 if [ -n "${SUDO_USER:-}" ]; then
     INSTALL_DIR="$(eval echo "~$SUDO_USER")/printbot"
 fi
@@ -17,10 +16,26 @@ GREEN='\033[0;32m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+CLONED_FRESH=false
+
+_rollback() {
+    echo ""
+    echo -e "${RED}${BOLD}Installation failed. Rolling back...${NC}"
+    if [ "$CLONED_FRESH" = true ] && [ -d "$INSTALL_DIR" ]; then
+        echo "  Removing $INSTALL_DIR..."
+        rm -rf "$INSTALL_DIR"
+        echo "  Cleaned up."
+    fi
+    echo ""
+    echo "  Fix the issue and try again."
+    exit 1
+}
+
+trap _rollback ERR
+
 echo -e "${BOLD}PrintBot Installer${NC}"
 echo ""
 
-# Check root
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Run with sudo:${NC}"
     echo '  sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/mhd12e/printbot/main/install.sh)"'
@@ -41,10 +56,13 @@ else
     echo "Cloning PrintBot to $INSTALL_DIR..."
     git clone "$REPO" "$INSTALL_DIR"
     chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$INSTALL_DIR"
+    CLONED_FRESH=true
 fi
 
 echo ""
 
-# Hand off to printbot install
+# Disable our trap — printbot install has its own rollback
+trap - ERR
+
 chmod +x "$INSTALL_DIR/printbot"
 exec "$INSTALL_DIR/printbot" install
