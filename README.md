@@ -44,57 +44,77 @@ The bot tells you when:
 ```bash
 git clone https://github.com/mhd12e/printer_bot.git
 cd printer_bot
-chmod +x setup.sh
-sudo ./setup.sh
+sudo ./printbot install
 ```
 
-The setup script handles everything:
+That's it. The installer handles everything: system packages, CUPS, printer drivers, Python venv, config prompts, systemd service, and adds `printbot` to your PATH.
 
-1. Installs system packages (CUPS, HPLIP, LibreOffice, Python)
-2. Configures CUPS and printer drivers
-3. Walks you through printer setup (`hp-setup -i`)
-4. Creates a Python virtual environment and installs dependencies
-5. Prompts for your bot token and user ID
-6. Installs a **systemd service** — the bot starts on boot and restarts on crash
-
-After setup, the bot is running. Open it on Telegram and send `/start`.
+After install, open your bot on Telegram and send `/start`.
 
 ## Managing the Bot
 
 ```bash
-# Check status
-sudo systemctl status printer-bot
-
-# Watch live logs
-sudo journalctl -u printer-bot -f
-
-# Restart
-sudo systemctl restart printer-bot
-
-# Stop
-sudo systemctl stop printer-bot
+printbot status           # Check bot status, version, printer info
+printbot logs -f          # Follow live logs
+printbot logs 100         # Last 100 log lines
+sudo printbot restart     # Restart the bot
+sudo printbot stop        # Stop the bot
+sudo printbot start       # Start the bot
 ```
 
 ## Updating
 
 ```bash
-cd printer_bot
-git pull
-sudo systemctl restart printer-bot
+sudo printbot update
 ```
+
+Pulls latest code from git, updates Python packages, runs migrations (prompts for new config if needed), and restarts the service.
 
 ## Configuration
 
-All config lives in `.env` (created by the setup script):
+```bash
+printbot config               # Show config (secrets masked)
+sudo printbot config edit     # Open .env in editor
+sudo printbot config set KEY=VALUE  # Set a single value
+```
+
+Config lives in `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=your-bot-token
 ALLOWED_USER_IDS=123456789,987654321
 PRINTER_NAME=HP_Smart_Tank_725
+GEMINI_API_KEY=your-gemini-key  # optional, for voice notes
 ```
 
-- `ALLOWED_USER_IDS` — comma-separated Telegram user IDs that can use the bot
-- `PRINTER_NAME` — must match `lpstat -p | awk '{print $2}'`
+## Printer
+
+```bash
+printbot printer          # Show printer status and queue
+sudo printbot printer setup   # Run HP printer setup wizard
+```
+
+## Uninstall
+
+```bash
+sudo printbot uninstall   # Removes service and venv, keeps .env and code
+```
+
+## All Commands
+
+```
+printbot install          First-time setup
+printbot update           Pull, update deps, migrate, restart
+printbot uninstall        Remove service and venv
+printbot start/stop/restart   Service control
+printbot status           Status, version, printer info
+printbot logs [-f] [N]    View logs
+printbot config [show|edit|set]   Manage .env
+printbot printer [setup]  Printer info or setup wizard
+printbot migrate          Run pending migrations
+printbot version          Show version
+printbot help             Show all commands
+```
 
 ## How It Works
 

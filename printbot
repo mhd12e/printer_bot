@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════
+# printbot — CLI tool for managing PrinterBot
+# ═══════════════════════════════════════════════════════════════════
+
+VERSION="2.0.0"
+BOT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SERVICE_NAME="printer-bot"
+VENV_DIR="$BOT_DIR/venv"
+ENV_FILE="$BOT_DIR/.env"
+MIGRATION_DIR="$BOT_DIR/.migrations"
+VERSION_FILE="$BOT_DIR/.version"
+CLI_LINK="/usr/local/bin/printbot"
+
+# ── Colors ────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+info()    { echo -e "${BLUE}${BOLD}::${NC} $*"; }
+success() { echo -e "${GREEN}${BOLD}✓${NC} $*"; }
+warn()    { echo -e "${YELLOW}${BOLD}!${NC} $*"; }
+error()   { echo -e "${RED}${BOLD}✗${NC} $*" >&2; }
+step()    { echo -e "${BLUE}${BOLD}[$1/$2]${NC} $3"; }
+
+_is_installed() {
+    [ -d "$VENV_DIR" ] && [ -f "$ENV_FILE" ] && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null
+}
+
+_is_running() {
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
+}
+
+_require_installed() {
+    if ! _is_installed; then
+        error "PrinterBot is not installed."
+        echo "  Run: printbot install"
+        exit 1
+    fi
+}
+
+_require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "This command requires root. Run with sudo."
+        exit 1
+    fi
+}
+
+_get_installed_version() {
+    if [ -f "$VERSION_FILE" ]; then
+        cat "$VERSION_FILE"
+    else
+        echo "0.0.0"
+    fi
+}
+
+_set_version() {
+    echo "$VERSION" > "$VERSION_FILE"
+}
+
+# ── Migration system ─────────────────────────────────────────────
+# Each migration is a function named _migrate_FROM_TO
+# They run in order when the installed version is older than current
+
+_version_lt() {
+    # Returns 0 (true) if $1 < $2 using version comparison
+    [ "$1" = "$2" ] && return 1
+    local IFS=.
+    local i ver1=($1) ver2=($2)
+    for ((i=0; i<${#ver1[@]}; i++)); do
+        if ((10#${ver1[i]:-0} < 10#${ver2[i]:-0})); then
+            return 0
+        elif ((10#${ver1[i]:-0} > 10#${ver2[i]:-0})); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+_run_migrations() {
+    local old_ver="$(_get_installed_version)"
+
+    if [ "$old_ver" = "$VERSION" ]; then
+        return 0
+    fi
+
+    info "Migrating from v$old_ver to v$VERSION..."
+
+    # Migration: 0.0.0 -> 1.0.0 (legacy setup.sh installs)
+    if _version_lt "$old_ver" "1.0.0"; then
+        info "Migration: registering CLI tool..."
+        # Nothing special needed, install handles it
+    fi
+
+    # Migration: 1.0.0 -> 2.0.0 (add Gemini support)
+    if _version_lt "$old_ver" "2.0.0"; then
+        if [ -f "$ENV_FILE" ] && ! grep -q "GEMINI_API_KEY" "$ENV_FILE"; then
+            echo ""
+            warn "New feature: Voice notes via Google Gemini AI"
+            echo "  Get a free API key at: https://aistudio.google.com/apikey"
+            read -rp "  Gemini API key (press Enter to skip): " GEMINI_KEY
+            if [ -n "$GEMINI_KEY" ]; then
+                echo "GEMINI_API_KEY=$GEMINI_KEY" >> "$ENV_FILE"
+                success "Gemini API key added."
+            else
+                echo "  Skipped. Voice notes will be disabled."
+            fi
+        fi
+    fi
+
+    # Add future migrations here:
+    # if _version_lt "$old_ver" "3.0.0"; then
+    #     info "Migration: ..."
+    # fi
+
+    _set_version
+    success "Migration complete."
+}
+
+# ── env management ────────────────────────────────────────────────
+
+# Required env vars and their prompts
+declare -A ENV_REQUIRED=(
+    ["TELEGRAM_BOT_TOKEN"]="Telegram bot token (from @BotFather)"
+    ["ALLOWED_USER_IDS"]="Your Telegram user ID (from @userinfobot)"
+    ["PRINTER_NAME"]="Printer name in CUPS"
+)
+
+# Optional env vars
+declare -A ENV_OPTIONAL=(
+    ["GEMINI_API_KEY"]="Gemini API key (for voice notes, https://aistudio.google.com/apikey)"
+)
+
+_prompt_env_vars() {
+    local detected_printer
+    detected_printer=$(lpstat -p 2>/dev/null | head -1 | awk '{print $2}' || echo "HP_Smart_Tank_725")
+
+    echo ""
+    info "Bot configuration"
+    echo ""
+
+    read -rp "  Telegram bot token (from @BotFather): " BOT_TOKEN
+    read -rp "  Your Telegram user ID (from @userinfobot): " USER_IDS
+
+    echo ""
+    info "Optional features"
+    echo "  Get a free Gemini key at: https://aistudio.google.com/apikey"
+    read -rp "  Gemini API key (Enter to skip): " GEMINI_KEY
+
+    {
+        echo "TELEGRAM_BOT_TOKEN=$BOT_TOKEN"
+        echo "ALLOWED_USER_IDS=$USER_IDS"
+        echo "PRINTER_NAME=$detected_printer"
+        [ -n "$GEMINI_KEY" ] && echo "GEMINI_API_KEY=$GEMINI_KEY"
+    } > "$ENV_FILE"
+
+    chmod 600 "$ENV_FILE"
+    success ".env created."
+}
+
+_check_missing_env() {
+    # Check for new optional vars not yet in .env
+    local added=0
+    for key in "${!ENV_OPTIONAL[@]}"; do
+        if ! grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+            echo ""
+            warn "New optional config: $key"
+            read -rp "  ${ENV_OPTIONAL[$key]} (Enter to skip): " val
+            if [ -n "$val" ]; then
+                echo "${key}=${val}" >> "$ENV_FILE"
+                success "$key added."
+                added=1
+            fi
+        fi
+    done
+    return 0
+}
+
+# ── Install service ───────────────────────────────────────────────
+
+_install_service() {
+    sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<SERVICEEOF
+[Unit]
+Description=Telegram Printer Bot
+After=network-online.target cups.service
+Wants=network-online.target cups.service
+
+[Service]
+Type=simple
+User=$SUDO_USER
+Group=$(id -gn "$SUDO_USER")
+WorkingDirectory=$BOT_DIR
+ExecStart=$VENV_DIR/bin/python3 $BOT_DIR/bot.py
+Restart=always
+RestartSec=5
+EnvironmentFile=$ENV_FILE
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp/printer_bot $BOT_DIR
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$SERVICE_NAME"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Commands
+# ═══════════════════════════════════════════════════════════════════
+
+cmd_install() {
+    _require_root
+
+    if _is_installed; then
+        error "PrinterBot is already installed."
+        echo ""
+        echo "  To update:    sudo printbot update"
+        echo "  To reinstall: sudo printbot uninstall && sudo printbot install"
+        exit 1
+    fi
+
+    echo -e "${BOLD}PrinterBot Installer${NC}"
+    echo ""
+
+    # 1. System packages
+    step 1 7 "Installing system packages..."
+    apt update -qq
+    apt install -y -qq \
+        cups libcups2-dev \
+        hplip \
+        libreoffice-core libreoffice-writer libreoffice-impress \
+        poppler-utils \
+        python3 python3-pip python3-venv python3-dev \
+        gcc > /dev/null
+    success "System packages installed."
+
+    # 2. CUPS
+    step 2 7 "Configuring CUPS..."
+    systemctl enable --now cups > /dev/null 2>&1
+    usermod -aG lpadmin "$SUDO_USER"
+    success "CUPS configured."
+
+    # 3. Printer
+    step 3 7 "Setting up printer..."
+    if lpstat -p 2>/dev/null | grep -qi "hp"; then
+        echo "  HP printer already detected:"
+        lpstat -p 2>/dev/null | sed 's/^/    /'
+        echo ""
+        read -rp "  Skip printer setup? (Y/n): " SKIP_PRINTER
+        SKIP_PRINTER="${SKIP_PRINTER:-Y}"
+    else
+        SKIP_PRINTER="n"
+    fi
+
+    if [[ "${SKIP_PRINTER,,}" != "y" ]]; then
+        echo "  Connect the printer via USB now, then press Enter."
+        read -r
+        hp-setup -i
+        lpstat -p 2>/dev/null | sed 's/^/    /'
+    fi
+    success "Printer configured."
+
+    # 4. Python
+    step 4 7 "Setting up Python environment..."
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install --upgrade pip -q
+    "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" -q
+    success "Python packages installed."
+
+    # 5. Config
+    step 5 7 "Configuring bot..."
+    _prompt_env_vars
+
+    # 6. Temp dir
+    step 6 7 "Creating temp directory..."
+    mkdir -p /tmp/printer_bot
+    success "Done."
+
+    # 7. Service + CLI
+    step 7 7 "Installing service and CLI..."
+    _install_service
+
+    # Symlink CLI to PATH
+    ln -sf "$BOT_DIR/printbot" "$CLI_LINK"
+    chmod +x "$BOT_DIR/printbot"
+
+    # Set version
+    _set_version
+
+    # Start
+    systemctl start "$SERVICE_NAME"
+    success "Service started."
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Installation complete!${NC}"
+    echo ""
+    echo "  The bot is running and starts automatically on boot."
+    echo "  Open your bot on Telegram and send /start"
+    echo ""
+    echo -e "  ${DIM}Type 'printbot help' for all commands.${NC}"
+}
+
+cmd_update() {
+    _require_root
+    _require_installed
+
+    echo -e "${BOLD}Updating PrinterBot...${NC}"
+    echo ""
+
+    # Pull from git
+    if [ -d "$BOT_DIR/.git" ]; then
+        info "Pulling latest code..."
+        cd "$BOT_DIR"
+        git fetch origin 2>/dev/null || true
+        local LOCAL REMOTE
+        LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "none")
+        REMOTE=$(git rev-parse origin/main 2>/dev/null || echo "none")
+
+        if [ "$LOCAL" != "$REMOTE" ] && [ "$REMOTE" != "none" ]; then
+            git pull origin main
+            success "Code updated."
+
+            # Re-exec if printbot script itself changed
+            if git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -q "^printbot$"; then
+                info "CLI tool updated. Re-running..."
+                exec "$BOT_DIR/printbot" update
+            fi
+        else
+            success "Already on latest version."
+        fi
+    fi
+
+    # Update Python packages
+    info "Updating Python packages..."
+    "$VENV_DIR/bin/pip" install --upgrade pip -q
+    "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" --upgrade -q
+    success "Packages updated."
+
+    # Run migrations (prompts for new env vars etc.)
+    _run_migrations
+
+    # Refresh service file
+    _install_service
+
+    # Restart
+    systemctl restart "$SERVICE_NAME"
+    success "Service restarted."
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Update complete!${NC}"
+}
+
+cmd_uninstall() {
+    _require_root
+    _require_installed
+
+    echo -e "${BOLD}Uninstalling PrinterBot...${NC}"
+    echo ""
+    read -rp "  Are you sure? This will stop the bot and remove the service. (y/N): " CONFIRM
+    if [[ "${CONFIRM,,}" != "y" ]]; then
+        echo "  Aborted."
+        exit 0
+    fi
+
+    info "Stopping service..."
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl daemon-reload
+    success "Service removed."
+
+    info "Removing virtual environment..."
+    rm -rf "$VENV_DIR"
+    success "Venv removed."
+
+    info "Removing CLI link..."
+    rm -f "$CLI_LINK"
+    success "CLI link removed."
+
+    rm -f "$VERSION_FILE"
+
+    echo ""
+    success "Uninstalled."
+    echo ""
+    echo "  Your .env and bot code are still in: $BOT_DIR"
+    echo "  To remove everything: rm -rf $BOT_DIR"
+}
+
+cmd_start() {
+    _require_root
+    _require_installed
+
+    if _is_running; then
+        warn "Bot is already running."
+        return 0
+    fi
+
+    systemctl start "$SERVICE_NAME"
+    success "Bot started."
+}
+
+cmd_stop() {
+    _require_root
+    _require_installed
+
+    if ! _is_running; then
+        warn "Bot is not running."
+        return 0
+    fi
+
+    systemctl stop "$SERVICE_NAME"
+    success "Bot stopped."
+}
+
+cmd_restart() {
+    _require_root
+    _require_installed
+
+    systemctl restart "$SERVICE_NAME"
+    success "Bot restarted."
+}
+
+cmd_status() {
+    _require_installed
+
+    echo -e "${BOLD}PrinterBot Status${NC}"
+    echo ""
+
+    # Service status
+    if _is_running; then
+        echo -e "  Service:  ${GREEN}running${NC}"
+    else
+        echo -e "  Service:  ${RED}stopped${NC}"
+    fi
+
+    # Version
+    echo -e "  Version:  $(_get_installed_version)"
+
+    # Git info
+    if [ -d "$BOT_DIR/.git" ]; then
+        local commit
+        commit=$(git -C "$BOT_DIR" log -1 --format="%h %s" 2>/dev/null || echo "unknown")
+        echo -e "  Commit:   ${DIM}$commit${NC}"
+
+        # Check for updates
+        git -C "$BOT_DIR" fetch origin 2>/dev/null || true
+        local LOCAL REMOTE
+        LOCAL=$(git -C "$BOT_DIR" rev-parse HEAD 2>/dev/null || echo "")
+        REMOTE=$(git -C "$BOT_DIR" rev-parse origin/main 2>/dev/null || echo "")
+        if [ -n "$LOCAL" ] && [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
+            echo -e "  Updates:  ${YELLOW}available${NC} (run: sudo printbot update)"
+        else
+            echo -e "  Updates:  ${GREEN}up to date${NC}"
+        fi
+    fi
+
+    # Uptime
+    if _is_running; then
+        local uptime
+        uptime=$(systemctl show "$SERVICE_NAME" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "")
+        if [ -n "$uptime" ]; then
+            echo -e "  Since:    $uptime"
+        fi
+    fi
+
+    # Printer
+    echo ""
+    local printer_info
+    printer_info=$(lpstat -p 2>/dev/null | head -1 || echo "")
+    if [ -n "$printer_info" ]; then
+        echo -e "  Printer:  $printer_info"
+    else
+        echo -e "  Printer:  ${RED}not detected${NC}"
+    fi
+
+    # Config
+    echo ""
+    echo -e "  Config:   $ENV_FILE"
+    echo -e "  Install:  $BOT_DIR"
+    echo ""
+}
+
+cmd_logs() {
+    _require_installed
+
+    local lines="${1:-50}"
+    local follow="${2:-}"
+
+    if [ "$lines" = "-f" ] || [ "$lines" = "--follow" ]; then
+        journalctl -u "$SERVICE_NAME" -f --no-hostname
+    else
+        journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager --no-hostname
+        echo ""
+        echo -e "${DIM}Showing last $lines lines. Use 'printbot logs -f' for live output.${NC}"
+    fi
+}
+
+cmd_config() {
+    _require_installed
+    local action="${1:-show}"
+
+    case "$action" in
+        show)
+            echo -e "${BOLD}Current configuration:${NC}"
+            echo ""
+            while IFS='=' read -r key value; do
+                [[ "$key" =~ ^#.*$ ]] && continue
+                [ -z "$key" ] && continue
+                # Mask sensitive values
+                if [[ "$key" == *TOKEN* ]] || [[ "$key" == *KEY* ]]; then
+                    local masked="${value:0:8}..."
+                    echo -e "  ${BOLD}$key${NC} = ${DIM}$masked${NC}"
+                else
+                    echo -e "  ${BOLD}$key${NC} = $value"
+                fi
+            done < "$ENV_FILE"
+            echo ""
+            echo -e "${DIM}Edit: sudo printbot config edit${NC}"
+            echo -e "${DIM}Set:  sudo printbot config set KEY=VALUE${NC}"
+            ;;
+        edit)
+            _require_root
+            "${EDITOR:-nano}" "$ENV_FILE"
+            echo ""
+            warn "Restart the bot for changes to take effect:"
+            echo "  sudo printbot restart"
+            ;;
+        set)
+            _require_root
+            shift
+            if [ $# -eq 0 ]; then
+                error "Usage: printbot config set KEY=VALUE"
+                exit 1
+            fi
+            local pair="$1"
+            local key="${pair%%=*}"
+            local val="${pair#*=}"
+
+            if [ "$key" = "$pair" ]; then
+                error "Usage: printbot config set KEY=VALUE"
+                exit 1
+            fi
+
+            # Remove existing key if present
+            if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+                sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+                success "Updated $key."
+            else
+                echo "${key}=${val}" >> "$ENV_FILE"
+                success "Added $key."
+            fi
+            echo ""
+            warn "Restart the bot for changes to take effect:"
+            echo "  sudo printbot restart"
+            ;;
+        *)
+            error "Unknown config action: $action"
+            echo "  Usage: printbot config [show|edit|set KEY=VALUE]"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_printer() {
+    echo -e "${BOLD}Printer Info${NC}"
+    echo ""
+
+    local printers
+    printers=$(lpstat -p 2>/dev/null || echo "")
+    if [ -z "$printers" ]; then
+        error "No printers found in CUPS."
+        echo "  Run: sudo printbot printer setup"
+        return 1
+    fi
+
+    echo "$printers" | while IFS= read -r line; do
+        if echo "$line" | grep -qi "idle"; then
+            echo -e "  ${GREEN}$line${NC}"
+        elif echo "$line" | grep -qi "printing"; then
+            echo -e "  ${BLUE}$line${NC}"
+        else
+            echo -e "  ${YELLOW}$line${NC}"
+        fi
+    done
+
+    echo ""
+
+    # Queue
+    local queue
+    queue=$(lpstat -o 2>/dev/null || echo "")
+    if [ -n "$queue" ]; then
+        echo -e "${BOLD}Print Queue:${NC}"
+        echo "$queue" | sed 's/^/  /'
+    else
+        echo -e "${DIM}Print queue is empty.${NC}"
+    fi
+
+    # Handle subcommand
+    local action="${1:-}"
+    if [ "$action" = "setup" ]; then
+        _require_root
+        echo ""
+        info "Running HP printer setup..."
+        hp-setup -i
+    fi
+}
+
+cmd_migrate() {
+    _require_root
+    _require_installed
+
+    _run_migrations
+}
+
+cmd_version() {
+    echo "printbot v$VERSION"
+    if [ -d "$BOT_DIR/.git" ]; then
+        local commit
+        commit=$(git -C "$BOT_DIR" log -1 --format="%h (%ai)" 2>/dev/null || echo "")
+        [ -n "$commit" ] && echo "commit $commit"
+    fi
+}
+
+cmd_help() {
+    echo -e "${BOLD}printbot${NC} — Telegram Printer Bot CLI"
+    echo ""
+    echo -e "${BOLD}Setup:${NC}"
+    echo "  install          Install PrinterBot (first time setup)"
+    echo "  update           Pull latest code, update deps, restart"
+    echo "  uninstall        Remove service and venv (keeps .env and code)"
+    echo "  migrate          Run pending migrations manually"
+    echo ""
+    echo -e "${BOLD}Service:${NC}"
+    echo "  start            Start the bot"
+    echo "  stop             Stop the bot"
+    echo "  restart          Restart the bot"
+    echo "  status           Show bot status, version, and printer info"
+    echo ""
+    echo -e "${BOLD}Logs:${NC}"
+    echo "  logs             Show last 50 log lines"
+    echo "  logs -f          Follow logs in real time"
+    echo "  logs 100         Show last N log lines"
+    echo ""
+    echo -e "${BOLD}Config:${NC}"
+    echo "  config           Show current config (secrets masked)"
+    echo "  config edit      Open .env in editor"
+    echo "  config set K=V   Set a config value"
+    echo ""
+    echo -e "${BOLD}Printer:${NC}"
+    echo "  printer          Show printer status and queue"
+    echo "  printer setup    Run HP printer setup wizard"
+    echo ""
+    echo -e "${BOLD}Other:${NC}"
+    echo "  version          Show version info"
+    echo "  help             Show this help"
+    echo ""
+    echo -e "${DIM}Most commands require sudo (service management).${NC}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Router
+# ═══════════════════════════════════════════════════════════════════
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        install)    cmd_install "$@" ;;
+        update)     cmd_update "$@" ;;
+        uninstall)  cmd_uninstall "$@" ;;
+        start)      cmd_start "$@" ;;
+        stop)       cmd_stop "$@" ;;
+        restart)    cmd_restart "$@" ;;
+        status)     cmd_status "$@" ;;
+        logs|log)   cmd_logs "$@" ;;
+        config|cfg) cmd_config "$@" ;;
+        printer)    cmd_printer "$@" ;;
+        migrate)    cmd_migrate "$@" ;;
+        version|-v|--version) cmd_version "$@" ;;
+        help|-h|--help)       cmd_help "$@" ;;
+        *)
+            error "Unknown command: $cmd"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
