@@ -41,13 +41,13 @@ The bot tells you when:
 
 ### Install
 
+One command:
+
 ```bash
-git clone https://github.com/mhd12e/printbot.git
-cd printbot
-sudo ./printbot install
+curl -fsSL https://raw.githubusercontent.com/mhd12e/printbot/main/install.sh | sudo bash
 ```
 
-That's it. The installer handles everything: system packages, CUPS, printer drivers, Python venv, config prompts, systemd service, and adds `printbot` to your PATH.
+This clones the repo to `~/printbot` and runs the full installer: system packages, CUPS, printer drivers, Python venv, config prompts, systemd service, and adds `printbot` to your PATH.
 
 After install, open your bot on Telegram and send `/start`.
 
