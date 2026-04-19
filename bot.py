@@ -179,18 +179,7 @@ def build_settings_screen(
     else:
         header = f"\U0001f4c4 {name}"
 
-    # Build labeled text
-    lines = [header, ""]
-    lines.append("Color:")
-    if not job["is_image"]:
-        lines.append("Sides:")
-    lines.append("Orientation:")
-    lines.append("Per sheet:")
-    if not job["is_image"]:
-        lines.append("Pages:")
-    lines.append(f"Copies: {s['copies']}")
-
-    text = "\n".join(lines)
+    text = header
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -360,7 +349,7 @@ def build_batch_settings_screen(
 
     file_count = len(files)
     header = f"\U0001f4e8 {file_count} files ready to print:\n{_build_batch_file_list(files)}"
-    text = f"{header}\n\nSettings (apply to all):"
+    text = header
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -474,7 +463,7 @@ def build_batch_file_settings_screen(
     else:
         header = f"File {index + 1}: {name}"
 
-    text = f"{header}\nPer-file settings:"
+    text = header
 
     rows: list[list[InlineKeyboardButton]] = []
     prefix = f"bfset:{index}"
