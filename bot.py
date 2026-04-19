@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from functools import wraps
 from pathlib import Path
@@ -18,15 +19,8 @@ from telegram.ext import (
 
 import config
 import converter
+import gemini
 import printer
-
-# Valid fields and their allowed values for setting toggles
-_VALID_SETTINGS = {
-    "color": {"color", "bw"},
-    "sides": {"one", "long", "short"},
-    "orientation": {"portrait", "landscape"},
-}
-_VALID_NUP = set(config.NUP_OPTIONS)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,6 +31,18 @@ logger = logging.getLogger(__name__)
 # Conversation states
 SETTINGS = 0
 PAGE_RANGE = 1
+VOICE_PENDING = 2
+BATCH_COLLECTING = 3
+BATCH_SETTINGS = 4
+BATCH_PAGE_RANGE = 5
+
+# Valid fields and their allowed values for setting toggles
+_VALID_SETTINGS = {
+    "color": {"color", "bw"},
+    "sides": {"one", "long", "short"},
+    "orientation": {"portrait", "landscape"},
+}
+_VALID_NUP = set(config.NUP_OPTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +76,12 @@ def authorized(func):
 @authorized
 async def cmd_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+) -> int:
+    # Clean up any pending state
+    context.user_data.pop("job", None)
+    context.user_data.pop("batch", None)
+    context.user_data.pop("voice_instruction", None)
+
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -85,25 +96,69 @@ async def cmd_start(
     )
     await update.message.reply_text(
         "Welcome to PrinterBot!\n"
-        "Just send me a file or photo and I'll print it.\n\n"
+        "Just send me a file or photo and I'll print it.\n"
+        "You can also send a voice note with print instructions.\n\n"
         "Supported: PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP",
         reply_markup=keyboard,
     )
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
-# Settings screen builder
+# Shared file preparation
+# ---------------------------------------------------------------------------
+
+async def _prepare_file(
+    tg_file_obj, file_name: str, ext: str, user_id: int, file_unique_id: str,
+    status_msg=None,
+) -> dict | str:
+    """Download, validate, convert a file. Returns file info dict or error string."""
+    local_path = config.TEMP_DIR / f"{user_id}_{file_unique_id}{ext}"
+    await tg_file_obj.download_to_drive(local_path)
+
+    if local_path.stat().st_size == 0:
+        converter.cleanup_temp_files(local_path)
+        return "File is empty."
+
+    is_image = converter.is_image(ext)
+    pdf_path = None
+    page_count = None
+
+    if converter.needs_conversion(ext):
+        if status_msg:
+            await status_msg.edit_text(f"Converting {file_name} to PDF\u2026")
+        try:
+            pdf_path = await converter.convert_to_pdf(local_path)
+        except Exception as e:
+            logger.error("Conversion failed: %s", e)
+            converter.cleanup_temp_files(local_path)
+            return "Conversion failed. The file may be corrupted."
+        page_count = await converter.get_pdf_page_count(pdf_path)
+    elif ext == ".pdf":
+        page_count = await converter.get_pdf_page_count(local_path)
+
+    return {
+        "file_path": local_path,
+        "pdf_path": pdf_path,
+        "original_name": file_name,
+        "is_image": is_image,
+        "page_count": page_count,
+        "settings": dict(config.DEFAULT_SETTINGS),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Settings screen builders
 # ---------------------------------------------------------------------------
 
 def _mark(label: str, settings: dict, field: str, value) -> str:
-    """Prefix with checkmark if this option is currently selected."""
     return f"\u2713 {label}" if settings[field] == value else label
 
 
 def build_settings_screen(
     job: dict,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Build the print-settings message text and inline keyboard."""
+    """Build single-file print-settings message and keyboard."""
     s = job["settings"]
     name = job["original_name"]
 
@@ -214,7 +269,9 @@ def build_settings_screen(
     # Actions
     rows.append(
         [
-            InlineKeyboardButton("\U0001f5a8 Print", callback_data="act:print"),
+            InlineKeyboardButton(
+                "\U0001f5a8 Print", callback_data="act:print"
+            ),
             InlineKeyboardButton("Cancel", callback_data="act:cancel"),
         ]
     )
@@ -223,7 +280,6 @@ def build_settings_screen(
 
 
 def _build_settings_summary(settings: dict) -> str:
-    """One-line summary of print settings."""
     parts = [
         "Color" if settings["color"] == "color" else "B\u200a&\u200aW",
         {
@@ -241,184 +297,262 @@ def _build_settings_summary(settings: dict) -> str:
     return " | ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# File handlers (conversation entry points)
-# ---------------------------------------------------------------------------
-
-@authorized
-async def handle_document(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle incoming document file."""
-    doc = update.message.document
-    file_name = doc.file_name or "document"
-    ext = Path(file_name).suffix.lower()
-
-    if ext not in config.SUPPORTED_EXTENSIONS:
-        await update.message.reply_text(
-            f"Can't print {ext} files.\n"
-            "Supported: PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP"
-        )
-        return ConversationHandler.END
-
-    # Download
-    tg_file = await doc.get_file()
-    local_path = (
-        config.TEMP_DIR / f"{update.effective_user.id}_{doc.file_unique_id}{ext}"
-    )
-    await tg_file.download_to_drive(local_path)
-
-    # Check for empty file
-    if local_path.stat().st_size == 0:
-        await update.message.reply_text("File is empty.")
-        converter.cleanup_temp_files(local_path)
-        return ConversationHandler.END
-
-    # Init job data
-    job = {
-        "file_path": local_path,
-        "pdf_path": None,
-        "original_name": file_name,
-        "is_image": converter.is_image(ext),
-        "page_count": None,
-        "settings": dict(config.DEFAULT_SETTINGS),
-        "message_id": None,
-        "cups_job_id": None,
-    }
-    context.user_data["job"] = job
-
-    if converter.needs_conversion(ext):
-        msg = await update.message.reply_text(
-            f"Converting {file_name} to PDF\u2026"
-        )
-        try:
-            pdf_path = await converter.convert_to_pdf(local_path)
-            job["pdf_path"] = pdf_path
-        except Exception as e:
-            logger.error("Conversion failed: %s", e)
-            await msg.edit_text(
-                "Conversion failed. The file may be corrupted."
+def _build_batch_file_list(files: list[dict]) -> str:
+    """Build numbered file list for batch screen header."""
+    lines = []
+    for i, f in enumerate(files, 1):
+        if f["is_image"]:
+            lines.append(f"  {i}. {f['original_name']} (image)")
+        elif f["page_count"]:
+            lines.append(
+                f"  {i}. {f['original_name']} ({f['page_count']} pages)"
             )
-            converter.cleanup_temp_files(local_path)
-            return ConversationHandler.END
+        else:
+            lines.append(f"  {i}. {f['original_name']}")
+    return "\n".join(lines)
 
-        job["page_count"] = await converter.get_pdf_page_count(pdf_path)
-        text, keyboard = build_settings_screen(job)
-        await msg.edit_text(text, reply_markup=keyboard)
-        job["message_id"] = msg.message_id
 
-    elif ext == ".pdf":
-        job["page_count"] = await converter.get_pdf_page_count(local_path)
-        text, keyboard = build_settings_screen(job)
-        msg = await update.message.reply_text(text, reply_markup=keyboard)
-        job["message_id"] = msg.message_id
+def build_batch_settings_screen(
+    batch: dict,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build batch settings message and keyboard."""
+    files = batch["files"]
+    s = batch["global_settings"]
+    has_docs = batch["has_documents"]
 
+    file_count = len(files)
+    header = f"{file_count} files ready to print:\n{_build_batch_file_list(files)}"
+    text = f"{header}\n\nGlobal settings (apply to all):"
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Color
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark("Color", s, "color", "color"),
+                callback_data="bset:color:color",
+            ),
+            InlineKeyboardButton(
+                _mark("B&W", s, "color", "bw"),
+                callback_data="bset:color:bw",
+            ),
+        ]
+    )
+
+    if has_docs:
+        # Sides
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    _mark("One-sided", s, "sides", "one"),
+                    callback_data="bset:sides:one",
+                ),
+                InlineKeyboardButton(
+                    _mark("Long edge", s, "sides", "long"),
+                    callback_data="bset:sides:long",
+                ),
+                InlineKeyboardButton(
+                    _mark("Short edge", s, "sides", "short"),
+                    callback_data="bset:sides:short",
+                ),
+            ]
+        )
+
+    # Orientation
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark("Portrait", s, "orientation", "portrait"),
+                callback_data="bset:orientation:portrait",
+            ),
+            InlineKeyboardButton(
+                _mark("Landscape", s, "orientation", "landscape"),
+                callback_data="bset:orientation:landscape",
+            ),
+        ]
+    )
+
+    if has_docs:
+        # Pages per sheet
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    _mark(str(n), s, "nup", n),
+                    callback_data=f"bset:nup:{n}",
+                )
+                for n in config.NUP_OPTIONS
+            ]
+        )
+
+    # Copies
+    rows.append(
+        [
+            InlineKeyboardButton("\u2212", callback_data="bset:copies:dec"),
+            InlineKeyboardButton(str(s["copies"]), callback_data="noop"),
+            InlineKeyboardButton("+", callback_data="bset:copies:inc"),
+        ]
+    )
+
+    # Per-file buttons (max 4 per row)
+    file_buttons = []
+    for i, f in enumerate(files):
+        short_name = f["original_name"]
+        if len(short_name) > 15:
+            short_name = short_name[:12] + "\u2026"
+        file_buttons.append(
+            InlineKeyboardButton(
+                f"{i + 1}. {short_name}", callback_data=f"bfile:{i}"
+            )
+        )
+    for j in range(0, len(file_buttons), 3):
+        rows.append(file_buttons[j : j + 3])
+
+    # Actions
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"\U0001f5a8 Print All ({file_count})",
+                callback_data="bact:print",
+            ),
+            InlineKeyboardButton("Cancel", callback_data="bact:cancel"),
+        ]
+    )
+
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_batch_file_settings_screen(
+    batch: dict, index: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build per-file settings screen within a batch."""
+    f = batch["files"][index]
+    s = f["settings"]
+    name = f["original_name"]
+
+    if f["is_image"]:
+        header = f"File {index + 1}: {name} \u2014 image"
+    elif f["page_count"]:
+        header = f"File {index + 1}: {name} \u2014 {f['page_count']} pages"
     else:
-        # Image sent as document
-        job["is_image"] = True
-        text, keyboard = build_settings_screen(job)
-        msg = await update.message.reply_text(text, reply_markup=keyboard)
-        job["message_id"] = msg.message_id
+        header = f"File {index + 1}: {name}"
 
-    return SETTINGS
+    text = f"{header}\nPer-file settings:"
 
+    rows: list[list[InlineKeyboardButton]] = []
+    prefix = f"bfset:{index}"
 
-@authorized
-async def handle_photo(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle incoming photo (compressed image)."""
-    photo = update.message.photo[-1]  # Largest resolution
-    tg_file = await photo.get_file()
-    local_path = (
-        config.TEMP_DIR
-        / f"{update.effective_user.id}_{photo.file_unique_id}.jpg"
+    # Color
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark("Color", s, "color", "color"),
+                callback_data=f"{prefix}:color:color",
+            ),
+            InlineKeyboardButton(
+                _mark("B&W", s, "color", "bw"),
+                callback_data=f"{prefix}:color:bw",
+            ),
+        ]
     )
-    await tg_file.download_to_drive(local_path)
 
-    job = {
-        "file_path": local_path,
-        "pdf_path": None,
-        "original_name": f"photo_{photo.file_unique_id}.jpg",
-        "is_image": True,
-        "page_count": None,
-        "settings": dict(config.DEFAULT_SETTINGS),
-        "message_id": None,
-        "cups_job_id": None,
-    }
-    context.user_data["job"] = job
+    if not f["is_image"]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    _mark("One-sided", s, "sides", "one"),
+                    callback_data=f"{prefix}:sides:one",
+                ),
+                InlineKeyboardButton(
+                    _mark("Long edge", s, "sides", "long"),
+                    callback_data=f"{prefix}:sides:long",
+                ),
+                InlineKeyboardButton(
+                    _mark("Short edge", s, "sides", "short"),
+                    callback_data=f"{prefix}:sides:short",
+                ),
+            ]
+        )
 
-    text, keyboard = build_settings_screen(job)
-    msg = await update.message.reply_text(text, reply_markup=keyboard)
-    job["message_id"] = msg.message_id
-    return SETTINGS
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark("Portrait", s, "orientation", "portrait"),
+                callback_data=f"{prefix}:orientation:portrait",
+            ),
+            InlineKeyboardButton(
+                _mark("Landscape", s, "orientation", "landscape"),
+                callback_data=f"{prefix}:orientation:landscape",
+            ),
+        ]
+    )
+
+    if not f["is_image"]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    _mark(str(n), s, "nup", n),
+                    callback_data=f"{prefix}:nup:{n}",
+                )
+                for n in config.NUP_OPTIONS
+            ]
+        )
+
+        if s["page_range"] == "all":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "\u2713 All",
+                        callback_data=f"{prefix}:page_range:all",
+                    ),
+                    InlineKeyboardButton(
+                        "Custom\u2026",
+                        callback_data=f"bpr:custom:{index}",
+                    ),
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "All",
+                        callback_data=f"{prefix}:page_range:all",
+                    ),
+                    InlineKeyboardButton(
+                        f"\u2713 Pages: {s['page_range']}",
+                        callback_data=f"bpr:custom:{index}",
+                    ),
+                ]
+            )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\u2212", callback_data=f"{prefix}:copies:dec"
+            ),
+            InlineKeyboardButton(str(s["copies"]), callback_data="noop"),
+            InlineKeyboardButton(
+                "+", callback_data=f"{prefix}:copies:inc"
+            ),
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\u2b05 Back to all files", callback_data="bfile:back"
+            )
+        ]
+    )
+
+    return text, InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
-# Settings handlers
+# Page range validation
 # ---------------------------------------------------------------------------
-
-async def handle_setting_toggle(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle any set:FIELD:VALUE callback — toggle setting, re-render."""
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split(":", 2)
-    if len(parts) != 3:
-        return SETTINGS
-
-    _, field, value = parts
-    job = context.user_data.get("job")
-    if not job:
-        return ConversationHandler.END
-
-    s = job["settings"]
-
-    if field == "copies":
-        if value == "inc":
-            s["copies"] = min(s["copies"] + 1, 99)
-        elif value == "dec":
-            s["copies"] = max(s["copies"] - 1, 1)
-    elif field == "nup":
-        nup_val = int(value)
-        if nup_val in _VALID_NUP:
-            s["nup"] = nup_val
-    elif field == "page_range":
-        if value == "all":
-            s["page_range"] = value
-    elif field in _VALID_SETTINGS:
-        if value in _VALID_SETTINGS[field]:
-            s[field] = value
-
-    text, keyboard = build_settings_screen(job)
-    await query.edit_message_text(text, reply_markup=keyboard)
-    return SETTINGS
-
-
-async def prompt_page_range(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Ask user to type a custom page range."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "Type page range (e.g. 1-3, 5, 8-10):"
-    )
-    return PAGE_RANGE
-
 
 def _validate_page_range(text: str, total_pages: int | None) -> str | None:
-    """Validate a page range string. Returns error message or None if valid.
-
-    Rules:
-    - Only digits, commas, dashes, spaces allowed
-    - Each segment is either a single page or a range (start-end)
-    - All pages must be >= 1
-    - In ranges, start must be <= end
-    - If total_pages is known, all pages must be <= total_pages
-    """
     cleaned = text.replace(" ", "")
     if not cleaned:
         return "Empty page range."
@@ -457,15 +591,740 @@ def _validate_page_range(text: str, total_pages: int | None) -> str | None:
             max_page = max(max_page, page)
 
     if total_pages and max_page > total_pages:
-        return f"Document only has {total_pages} pages, but you requested up to page {max_page}."
+        return (
+            f"Document only has {total_pages} pages, "
+            f"but you requested up to page {max_page}."
+        )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Voice helpers
+# ---------------------------------------------------------------------------
+
+async def _process_voice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> gemini.ParsedInstruction | None:
+    """Download, transcribe, parse a voice note. Returns ParsedInstruction or None on error."""
+    voice = update.message.voice
+
+    if not config.GEMINI_API_KEY:
+        await update.message.reply_text(
+            "Voice notes are not configured. Send a file and use buttons."
+        )
+        return None
+
+    if voice.duration and voice.duration > config.MAX_VOICE_DURATION:
+        await update.message.reply_text(
+            f"Voice note too long. Keep it under {config.MAX_VOICE_DURATION} seconds."
+        )
+        return None
+
+    tg_file = await voice.get_file()
+    local_path = (
+        config.TEMP_DIR
+        / f"{update.effective_user.id}_{voice.file_unique_id}.ogg"
+    )
+    await tg_file.download_to_drive(local_path)
+
+    msg = await update.message.reply_text("Listening\u2026")
+
+    try:
+        transcript = await gemini.transcribe_voice(local_path)
+        parsed = await gemini.parse_print_instruction(transcript)
+    except Exception as e:
+        logger.error("Gemini error: %s", e)
+        await msg.edit_text(
+            "Couldn't understand the voice note. Try again or use buttons."
+        )
+        return None
+    finally:
+        converter.cleanup_temp_files(local_path)
+
+    # Build response
+    response = f'I heard: "{parsed.transcript}"'
+    if parsed.clarification:
+        response += f"\n\n{parsed.clarification}"
+
+    await msg.edit_text(response)
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# File handlers (conversation entry points)
+# ---------------------------------------------------------------------------
+
+@authorized
+async def handle_document(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle incoming document — enters batch collecting mode."""
+    doc = update.message.document
+    file_name = doc.file_name or "document"
+    ext = Path(file_name).suffix.lower()
+
+    if ext not in config.SUPPORTED_EXTENSIONS:
+        await update.message.reply_text(
+            f"Can't print {ext} files.\n"
+            "Supported: PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP"
+        )
+        return ConversationHandler.END
+
+    tg_file = await doc.get_file()
+    msg = await update.message.reply_text(f"Received {file_name}\u2026")
+
+    result = await _prepare_file(
+        tg_file, file_name, ext, update.effective_user.id,
+        doc.file_unique_id, status_msg=msg,
+    )
+    if isinstance(result, str):
+        await msg.edit_text(result)
+        return ConversationHandler.END
+
+    file_info = result
+
+    # Apply pending voice instruction if any
+    voice = context.user_data.pop("voice_instruction", None)
+    if voice:
+        gemini.apply_parsed_to_settings(voice, file_info["settings"])
+
+    # Initialize batch
+    batch = context.user_data.get("batch")
+    if batch:
+        # Already collecting — append
+        batch["files"].append(file_info)
+        if not file_info["is_image"]:
+            batch["has_documents"] = True
+        else:
+            batch["has_images"] = True
+        n = len(batch["files"])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"Continue ({n} files)",
+                        callback_data="batch:done",
+                    )
+                ]
+            ]
+        )
+        await msg.edit_text(
+            f"{n} files received. Send more or tap Continue.",
+            reply_markup=keyboard,
+        )
+        batch["status_message_id"] = msg.message_id
+        return BATCH_COLLECTING
+
+    # Start new batch
+    context.user_data["batch"] = {
+        "files": [file_info],
+        "global_settings": dict(file_info["settings"]),
+        "status_message_id": msg.message_id,
+        "has_documents": not file_info["is_image"],
+        "has_images": file_info["is_image"],
+    }
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Continue (1 file)", callback_data="batch:done"
+                )
+            ]
+        ]
+    )
+    await msg.edit_text(
+        f"{file_name} received. Send more files or tap Continue.",
+        reply_markup=keyboard,
+    )
+    return BATCH_COLLECTING
+
+
+@authorized
+async def handle_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle incoming photo — enters batch collecting mode."""
+    photo = update.message.photo[-1]
+    tg_file = await photo.get_file()
+    file_name = f"photo_{photo.file_unique_id}.jpg"
+
+    local_path = (
+        config.TEMP_DIR
+        / f"{update.effective_user.id}_{photo.file_unique_id}.jpg"
+    )
+    await tg_file.download_to_drive(local_path)
+
+    file_info = {
+        "file_path": local_path,
+        "pdf_path": None,
+        "original_name": file_name,
+        "is_image": True,
+        "page_count": None,
+        "settings": dict(config.DEFAULT_SETTINGS),
+    }
+
+    # Apply pending voice instruction
+    voice = context.user_data.pop("voice_instruction", None)
+    if voice:
+        gemini.apply_parsed_to_settings(voice, file_info["settings"])
+
+    batch = context.user_data.get("batch")
+    if batch:
+        batch["files"].append(file_info)
+        batch["has_images"] = True
+        n = len(batch["files"])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"Continue ({n} files)",
+                        callback_data="batch:done",
+                    )
+                ]
+            ]
+        )
+        msg = await update.message.reply_text(
+            f"{n} files received. Send more or tap Continue.",
+            reply_markup=keyboard,
+        )
+        batch["status_message_id"] = msg.message_id
+        return BATCH_COLLECTING
+
+    context.user_data["batch"] = {
+        "files": [file_info],
+        "global_settings": dict(file_info["settings"]),
+        "status_message_id": None,
+        "has_documents": False,
+        "has_images": True,
+    }
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Continue (1 file)", callback_data="batch:done"
+                )
+            ]
+        ]
+    )
+    msg = await update.message.reply_text(
+        f"{file_name} received. Send more files or tap Continue.",
+        reply_markup=keyboard,
+    )
+    context.user_data["batch"]["status_message_id"] = msg.message_id
+    return BATCH_COLLECTING
+
+
+# ---------------------------------------------------------------------------
+# Voice handlers
+# ---------------------------------------------------------------------------
+
+@authorized
+async def handle_voice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Voice note as entry point — no file yet."""
+    parsed = await _process_voice(update, context)
+    if parsed is None:
+        return ConversationHandler.END
+
+    context.user_data["voice_instruction"] = parsed
+
+    await update.message.reply_text("Now send me the file to print.")
+    return VOICE_PENDING
+
+
+@authorized
+async def handle_voice_in_settings(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Voice note while viewing single-file settings."""
+    parsed = await _process_voice(update, context)
+    if parsed is None:
+        return SETTINGS
+
+    job = context.user_data.get("job")
+    if not job:
+        return ConversationHandler.END
+
+    gemini.apply_parsed_to_settings(parsed, job["settings"])
+
+    text, keyboard = build_settings_screen(job)
+    msg = await update.message.reply_text(text, reply_markup=keyboard)
+    job["message_id"] = msg.message_id
+    return SETTINGS
+
+
+async def handle_voice_in_batch(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Voice note during batch collection — applies to global settings."""
+    parsed = await _process_voice(update, context)
+    if parsed is None:
+        return BATCH_COLLECTING
+
+    batch = context.user_data.get("batch")
+    if batch:
+        gemini.apply_parsed_to_settings(parsed, batch["global_settings"])
+        # Also update each file's settings
+        for f in batch["files"]:
+            gemini.apply_parsed_to_settings(parsed, f["settings"])
+
+    return BATCH_COLLECTING
+
+
+async def handle_voice_in_batch_settings(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Voice note while viewing batch settings screen."""
+    parsed = await _process_voice(update, context)
+    if parsed is None:
+        return BATCH_SETTINGS
+
+    batch = context.user_data.get("batch")
+    if not batch:
+        return ConversationHandler.END
+
+    gemini.apply_parsed_to_settings(parsed, batch["global_settings"])
+    for f in batch["files"]:
+        gemini.apply_parsed_to_settings(parsed, f["settings"])
+
+    text, keyboard = build_batch_settings_screen(batch)
+    msg = await update.message.reply_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+# ---------------------------------------------------------------------------
+# Batch handlers
+# ---------------------------------------------------------------------------
+
+async def handle_batch_file(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Additional document during batch collection."""
+    doc = update.message.document
+    file_name = doc.file_name or "document"
+    ext = Path(file_name).suffix.lower()
+
+    if ext not in config.SUPPORTED_EXTENSIONS:
+        await update.message.reply_text(
+            f"Can't print {ext} files. Skipped."
+        )
+        return BATCH_COLLECTING
+
+    tg_file = await doc.get_file()
+    msg = await update.message.reply_text(f"Processing {file_name}\u2026")
+
+    result = await _prepare_file(
+        tg_file, file_name, ext, update.effective_user.id,
+        doc.file_unique_id, status_msg=msg,
+    )
+    if isinstance(result, str):
+        await msg.edit_text(f"{file_name}: {result}")
+        return BATCH_COLLECTING
+
+    batch = context.user_data["batch"]
+    # Apply global settings to new file
+    result["settings"] = dict(batch["global_settings"])
+    batch["files"].append(result)
+    if not result["is_image"]:
+        batch["has_documents"] = True
+    else:
+        batch["has_images"] = True
+
+    n = len(batch["files"])
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Continue ({n} files)", callback_data="batch:done"
+                )
+            ]
+        ]
+    )
+    await msg.edit_text(
+        f"{n} files received. Send more or tap Continue.",
+        reply_markup=keyboard,
+    )
+    batch["status_message_id"] = msg.message_id
+    return BATCH_COLLECTING
+
+
+async def handle_batch_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Additional photo during batch collection."""
+    photo = update.message.photo[-1]
+    tg_file = await photo.get_file()
+    file_name = f"photo_{photo.file_unique_id}.jpg"
+
+    local_path = (
+        config.TEMP_DIR
+        / f"{update.effective_user.id}_{photo.file_unique_id}.jpg"
+    )
+    await tg_file.download_to_drive(local_path)
+
+    batch = context.user_data["batch"]
+    file_info = {
+        "file_path": local_path,
+        "pdf_path": None,
+        "original_name": file_name,
+        "is_image": True,
+        "page_count": None,
+        "settings": dict(batch["global_settings"]),
+    }
+    batch["files"].append(file_info)
+    batch["has_images"] = True
+
+    n = len(batch["files"])
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Continue ({n} files)", callback_data="batch:done"
+                )
+            ]
+        ]
+    )
+    msg = await update.message.reply_text(
+        f"{n} files received. Send more or tap Continue.",
+        reply_markup=keyboard,
+    )
+    batch["status_message_id"] = msg.message_id
+    return BATCH_COLLECTING
+
+
+async def handle_batch_done(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """User tapped Continue — show settings."""
+    query = update.callback_query
+    await query.answer()
+
+    batch = context.user_data.get("batch")
+    if not batch or not batch["files"]:
+        await query.edit_message_text("No files to print.")
+        return ConversationHandler.END
+
+    if len(batch["files"]) == 1:
+        # Single file — switch to normal flow
+        job = batch["files"][0]
+        job["message_id"] = None
+        job["cups_job_id"] = None
+        context.user_data["job"] = job
+        context.user_data.pop("batch", None)
+
+        text, keyboard = build_settings_screen(job)
+        await query.edit_message_text(text, reply_markup=keyboard)
+        job["message_id"] = query.message.message_id
+        return SETTINGS
+
+    # Multiple files — batch settings
+    text, keyboard = build_batch_settings_screen(batch)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def handle_batch_setting_toggle(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Toggle a global batch setting."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        return BATCH_SETTINGS
+
+    _, field, value = parts
+    batch = context.user_data.get("batch")
+    if not batch:
+        return ConversationHandler.END
+
+    s = batch["global_settings"]
+
+    if field == "copies":
+        if value == "inc":
+            s["copies"] = min(s["copies"] + 1, 99)
+        elif value == "dec":
+            s["copies"] = max(s["copies"] - 1, 1)
+    elif field == "nup":
+        nup_val = int(value)
+        if nup_val in _VALID_NUP:
+            s["nup"] = nup_val
+    elif field in _VALID_SETTINGS:
+        if value in _VALID_SETTINGS[field]:
+            s[field] = value
+
+    # Propagate to all files
+    for f in batch["files"]:
+        f["settings"] = dict(s)
+
+    text, keyboard = build_batch_settings_screen(batch)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def handle_batch_file_expand(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Show per-file settings for a specific file."""
+    query = update.callback_query
+    await query.answer()
+
+    index = int(query.data.split(":")[1])
+    batch = context.user_data.get("batch")
+    if not batch or index >= len(batch["files"]):
+        return BATCH_SETTINGS
+
+    text, keyboard = build_batch_file_settings_screen(batch, index)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def handle_batch_file_back(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Return from per-file view to batch overview."""
+    query = update.callback_query
+    await query.answer()
+
+    batch = context.user_data.get("batch")
+    if not batch:
+        return ConversationHandler.END
+
+    text, keyboard = build_batch_settings_screen(batch)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def handle_batch_file_setting_toggle(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Toggle a per-file setting within batch."""
+    query = update.callback_query
+    await query.answer()
+
+    # bfset:{index}:{field}:{value}
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        return BATCH_SETTINGS
+
+    _, index_str, field, value = parts
+    index = int(index_str)
+    batch = context.user_data.get("batch")
+    if not batch or index >= len(batch["files"]):
+        return BATCH_SETTINGS
+
+    s = batch["files"][index]["settings"]
+
+    if field == "copies":
+        if value == "inc":
+            s["copies"] = min(s["copies"] + 1, 99)
+        elif value == "dec":
+            s["copies"] = max(s["copies"] - 1, 1)
+    elif field == "nup":
+        nup_val = int(value)
+        if nup_val in _VALID_NUP:
+            s["nup"] = nup_val
+    elif field == "page_range":
+        if value == "all":
+            s["page_range"] = value
+    elif field in _VALID_SETTINGS:
+        if value in _VALID_SETTINGS[field]:
+            s[field] = value
+
+    text, keyboard = build_batch_file_settings_screen(batch, index)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def prompt_batch_page_range(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Prompt for custom page range for a batch file."""
+    query = update.callback_query
+    await query.answer()
+
+    index = int(query.data.split(":")[2])
+    context.user_data["batch_pr_index"] = index
+
+    f = context.user_data["batch"]["files"][index]
+    await query.edit_message_text(
+        f"Page range for {f['original_name']} (e.g. 1-3, 5, 8-10):"
+    )
+    return BATCH_PAGE_RANGE
+
+
+async def handle_batch_page_range_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receive page range text for a batch file."""
+    text = update.message.text.strip()
+    batch = context.user_data.get("batch")
+    index = context.user_data.get("batch_pr_index", 0)
+
+    if not batch or index >= len(batch["files"]):
+        return ConversationHandler.END
+
+    f = batch["files"][index]
+    error = _validate_page_range(text, f.get("page_count"))
+    if error:
+        await update.message.reply_text(
+            f"{error}\nTry again (e.g. 1-3, 5, 8-10):"
+        )
+        return BATCH_PAGE_RANGE
+
+    f["settings"]["page_range"] = text.replace(" ", "")
+
+    txt, keyboard = build_batch_file_settings_screen(batch, index)
+    await update.message.reply_text(txt, reply_markup=keyboard)
+    return BATCH_SETTINGS
+
+
+async def handle_batch_print(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Print all files in the batch."""
+    query = update.callback_query
+    await query.answer()
+
+    batch = context.user_data.get("batch")
+    if not batch or not batch["files"]:
+        await query.edit_message_text("No files to print.")
+        return ConversationHandler.END
+
+    # Validate all page ranges
+    for f in batch["files"]:
+        if f["settings"]["page_range"] != "all" and not f["is_image"]:
+            error = _validate_page_range(
+                f["settings"]["page_range"], f.get("page_count")
+            )
+            if error:
+                await query.answer(
+                    f"{f['original_name']}: {error}", show_alert=True
+                )
+                return BATCH_SETTINGS
+
+    # Submit all jobs
+    lines = []
+    for f in batch["files"]:
+        print_path = f.get("pdf_path") or f["file_path"]
+
+        if not Path(print_path).exists() or Path(print_path).stat().st_size == 0:
+            lines.append(f"{f['original_name']}: file missing, skipped")
+            continue
+
+        try:
+            job_id = await printer.async_submit_job(
+                print_path,
+                f["original_name"],
+                f["settings"],
+                is_image=f.get("is_image", False),
+            )
+        except Exception as e:
+            lines.append(f"{f['original_name']}: failed ({e})")
+            continue
+
+        lines.append(f"#{job_id} \u2014 {f['original_name']}")
+        summary = _build_settings_summary(f["settings"])
+
+        context.bot_data.setdefault("active_jobs", {})[job_id] = {
+            "chat_id": update.effective_chat.id,
+            "message_id": query.message.message_id,
+            "original_name": f["original_name"],
+            "summary": summary,
+            "user_id": update.effective_user.id,
+            "file_path": str(f["file_path"]),
+            "pdf_path": str(f["pdf_path"]) if f.get("pdf_path") else None,
+            "settings": dict(f["settings"]),
+            "is_image": f.get("is_image", False),
+            "last_state": None,
+        }
+
+    await query.edit_message_text(
+        f"Printing {len(batch['files'])} files:\n" + "\n".join(lines)
+    )
+    context.user_data.pop("batch", None)
+    return ConversationHandler.END
+
+
+async def handle_batch_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Cancel entire batch."""
+    query = update.callback_query
+    await query.answer()
+
+    batch = context.user_data.pop("batch", None)
+    if batch:
+        for f in batch["files"]:
+            paths = [f["file_path"]]
+            if f.get("pdf_path"):
+                paths.append(f["pdf_path"])
+            converter.cleanup_temp_files(*paths)
+
+    context.user_data.pop("batch_pr_index", None)
+    await query.edit_message_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Single-file settings handlers
+# ---------------------------------------------------------------------------
+
+async def handle_setting_toggle(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        return SETTINGS
+
+    _, field, value = parts
+    job = context.user_data.get("job")
+    if not job:
+        return ConversationHandler.END
+
+    s = job["settings"]
+
+    if field == "copies":
+        if value == "inc":
+            s["copies"] = min(s["copies"] + 1, 99)
+        elif value == "dec":
+            s["copies"] = max(s["copies"] - 1, 1)
+    elif field == "nup":
+        nup_val = int(value)
+        if nup_val in _VALID_NUP:
+            s["nup"] = nup_val
+    elif field == "page_range":
+        if value == "all":
+            s["page_range"] = value
+    elif field in _VALID_SETTINGS:
+        if value in _VALID_SETTINGS[field]:
+            s[field] = value
+
+    text, keyboard = build_settings_screen(job)
+    await query.edit_message_text(text, reply_markup=keyboard)
+    return SETTINGS
+
+
+async def prompt_page_range(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Type page range (e.g. 1-3, 5, 8-10):"
+    )
+    return PAGE_RANGE
 
 
 async def handle_page_range_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Receive typed page range, validate, update settings."""
     text = update.message.text.strip()
 
     job = context.user_data.get("job")
@@ -487,13 +1346,12 @@ async def handle_page_range_input(
 
 
 # ---------------------------------------------------------------------------
-# Print action
+# Print action (single file)
 # ---------------------------------------------------------------------------
 
 async def handle_print(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Submit the job to CUPS and start live status tracking."""
     query = update.callback_query
     await query.answer()
 
@@ -502,7 +1360,6 @@ async def handle_print(
         await query.edit_message_text("No file to print.")
         return ConversationHandler.END
 
-    # Validate page range one more time before printing
     s = job["settings"]
     if s["page_range"] != "all":
         error = _validate_page_range(s["page_range"], job.get("page_count"))
@@ -510,9 +1367,8 @@ async def handle_print(
             await query.answer(error, show_alert=True)
             return SETTINGS
 
-    print_path = job["pdf_path"] or job["file_path"]
+    print_path = job.get("pdf_path") or job["file_path"]
 
-    # Check file is not empty
     if not Path(print_path).exists() or Path(print_path).stat().st_size == 0:
         await query.edit_message_text("File is empty or missing.")
         return ConversationHandler.END
@@ -521,7 +1377,9 @@ async def handle_print(
 
     try:
         job_id = await printer.async_submit_job(
-            print_path, job["original_name"], job["settings"],
+            print_path,
+            job["original_name"],
+            job["settings"],
             is_image=job.get("is_image", False),
         )
     except Exception as e:
@@ -547,7 +1405,6 @@ async def handle_print(
     )
     await query.edit_message_text(status_text, reply_markup=keyboard)
 
-    # Register for background polling
     context.bot_data.setdefault("active_jobs", {})[job_id] = {
         "chat_id": update.effective_chat.id,
         "message_id": query.message.message_id,
@@ -555,7 +1412,7 @@ async def handle_print(
         "summary": summary,
         "user_id": update.effective_user.id,
         "file_path": str(job["file_path"]),
-        "pdf_path": str(job["pdf_path"]) if job["pdf_path"] else None,
+        "pdf_path": str(job["pdf_path"]) if job.get("pdf_path") else None,
         "settings": dict(job["settings"]),
         "is_image": job.get("is_image", False),
         "last_state": None,
@@ -565,13 +1422,12 @@ async def handle_print(
 
 
 # ---------------------------------------------------------------------------
-# Cancel from settings
+# Cancel from settings (single file)
 # ---------------------------------------------------------------------------
 
 async def handle_cancel(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Cancel print setup, clean up temp files."""
     query = update.callback_query
     await query.answer()
 
@@ -594,7 +1450,6 @@ async def handle_cancel(
 async def handle_printer_status(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Show printer status."""
     query = update.callback_query
     await query.answer()
 
@@ -625,7 +1480,6 @@ async def handle_printer_status(
 async def handle_print_queue(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Show print queue with cancel buttons."""
     query = update.callback_query
     await query.answer()
 
@@ -642,7 +1496,9 @@ async def handle_print_queue(
     lines = ["Print Queue:"]
     buttons: list[InlineKeyboardButton] = []
     for j in jobs:
-        lines.append(f"#{j.job_id} \u2014 {j.title} \u2014 {j.state_text}")
+        lines.append(
+            f"#{j.job_id} \u2014 {j.title} \u2014 {j.state_text}"
+        )
         buttons.append(
             InlineKeyboardButton(
                 f"Cancel #{j.job_id}",
@@ -650,7 +1506,6 @@ async def handle_print_queue(
             )
         )
 
-    # Arrange cancel buttons in rows of 2, plus Cancel All
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     rows.append(
         [InlineKeyboardButton("Cancel All", callback_data="q:cancelall")]
@@ -665,7 +1520,6 @@ async def handle_print_queue(
 async def handle_job_cancel(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Cancel a specific print job."""
     query = update.callback_query
     await query.answer()
 
@@ -680,7 +1534,6 @@ async def handle_job_cancel(
 async def handle_cancel_all(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Cancel all print jobs."""
     query = update.callback_query
     await query.answer()
 
@@ -694,7 +1547,6 @@ async def handle_cancel_all(
 async def handle_retry(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Retry a failed print job with the same settings."""
     query = update.callback_query
     await query.answer()
 
@@ -709,14 +1561,15 @@ async def handle_retry(
 
     try:
         new_id = await printer.async_submit_job(
-            Path(print_path), failed["original_name"], failed["settings"],
+            Path(print_path),
+            failed["original_name"],
+            failed["settings"],
             is_image=failed.get("is_image", False),
         )
     except Exception as e:
         await query.edit_message_text(f"Retry failed: {e}")
         return
 
-    # Track new job
     context.bot_data.setdefault("active_jobs", {})[new_id] = {
         **failed,
         "last_state": None,
@@ -747,10 +1600,8 @@ async def handle_retry(
 async def poll_cups_status(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Background job: poll CUPS for job & printer state changes."""
     active_jobs: dict = context.bot_data.get("active_jobs", {})
 
-    # --- Job monitoring ---
     finished_ids: list[int] = []
 
     for job_id, info in list(active_jobs.items()):
@@ -765,11 +1616,10 @@ async def poll_cups_status(
 
         current_state = job_info.state
         if current_state == info.get("last_state"):
-            continue  # No change
+            continue
 
         info["last_state"] = current_state
 
-        # Build updated status
         if current_state == printer.JOB_PROCESSING:
             progress = ""
             if job_info.pages_completed and job_info.total_pages:
@@ -793,7 +1643,6 @@ async def poll_cups_status(
             status_line = "Status: Done! \u2705"
             keyboard = None
             finished_ids.append(job_id)
-            # Proactive notification
             try:
                 await context.bot.send_message(
                     info["chat_id"],
@@ -873,9 +1722,8 @@ async def poll_cups_status(
                 reply_markup=keyboard,
             )
         except Exception:
-            pass  # Message may have been deleted
+            pass
 
-    # Clean up finished jobs and temp files
     for job_id in finished_ids:
         info = active_jobs.pop(job_id, None)
         if info and info.get("last_state") == printer.JOB_COMPLETED:
@@ -884,7 +1732,7 @@ async def poll_cups_status(
                 paths.append(Path(info["pdf_path"]))
             converter.cleanup_temp_files(*paths)
 
-    # --- Printer state monitoring ---
+    # Printer state monitoring
     try:
         status = await printer.async_get_status()
     except Exception:
@@ -912,7 +1760,7 @@ async def poll_cups_status(
 
     context.bot_data["printer_online"] = status.is_online
 
-    # --- Ink level warnings ---
+    # Ink level warnings
     if status.ink_levels:
         for color, level in status.ink_levels.items():
             key = f"ink_warned_{color}"
@@ -937,11 +1785,11 @@ async def poll_cups_status(
 def main() -> None:
     application = Application.builder().token(config.BOT_TOKEN).build()
 
-    # Conversation: file → settings → print
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Document.ALL, handle_document),
             MessageHandler(filters.PHOTO, handle_photo),
+            MessageHandler(filters.VOICE, handle_voice),
         ],
         states={
             SETTINGS: [
@@ -957,6 +1805,9 @@ def main() -> None:
                 CallbackQueryHandler(
                     handle_cancel, pattern=r"^act:cancel$"
                 ),
+                MessageHandler(
+                    filters.VOICE, handle_voice_in_settings
+                ),
             ],
             PAGE_RANGE: [
                 MessageHandler(
@@ -965,6 +1816,62 @@ def main() -> None:
                 ),
                 CallbackQueryHandler(
                     handle_cancel, pattern=r"^act:cancel$"
+                ),
+            ],
+            VOICE_PENDING: [
+                MessageHandler(
+                    filters.Document.ALL, handle_document
+                ),
+                MessageHandler(filters.PHOTO, handle_photo),
+                MessageHandler(filters.VOICE, handle_voice),
+            ],
+            BATCH_COLLECTING: [
+                MessageHandler(
+                    filters.Document.ALL, handle_batch_file
+                ),
+                MessageHandler(filters.PHOTO, handle_batch_photo),
+                MessageHandler(
+                    filters.VOICE, handle_voice_in_batch
+                ),
+                CallbackQueryHandler(
+                    handle_batch_done, pattern=r"^batch:done$"
+                ),
+            ],
+            BATCH_SETTINGS: [
+                CallbackQueryHandler(
+                    handle_batch_setting_toggle, pattern=r"^bset:"
+                ),
+                CallbackQueryHandler(
+                    handle_batch_file_setting_toggle,
+                    pattern=r"^bfset:",
+                ),
+                CallbackQueryHandler(
+                    handle_batch_file_expand, pattern=r"^bfile:\d+$"
+                ),
+                CallbackQueryHandler(
+                    handle_batch_file_back, pattern=r"^bfile:back$"
+                ),
+                CallbackQueryHandler(
+                    prompt_batch_page_range,
+                    pattern=r"^bpr:custom:\d+$",
+                ),
+                CallbackQueryHandler(
+                    handle_batch_print, pattern=r"^bact:print$"
+                ),
+                CallbackQueryHandler(
+                    handle_batch_cancel, pattern=r"^bact:cancel$"
+                ),
+                MessageHandler(
+                    filters.VOICE, handle_voice_in_batch_settings
+                ),
+            ],
+            BATCH_PAGE_RANGE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    handle_batch_page_range_input,
+                ),
+                CallbackQueryHandler(
+                    handle_batch_cancel, pattern=r"^bact:cancel$"
                 ),
             ],
         },

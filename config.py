@@ -13,6 +13,9 @@ PRINTER_NAME: str = os.getenv("PRINTER_NAME", "HP_Smart_Tank_725")
 TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", "/tmp/printer_bot"))
 CUPS_POLL_INTERVAL: int = int(os.getenv("CUPS_POLL_INTERVAL", "3"))
 
+# Gemini (optional — voice features disabled if not set)
+GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
+
 # Supported file extensions
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
@@ -38,5 +41,22 @@ DEFAULT_SETTINGS = {
     "page_range": "all",
     "copies": 1,
 }
+
+# Human-readable option descriptions (used in Gemini prompts)
+AVAILABLE_OPTIONS = {
+    "color": {"color": "full color", "bw": "black and white"},
+    "sides": {
+        "one": "one-sided",
+        "long": "duplex long edge (normal two-sided)",
+        "short": "duplex short edge",
+    },
+    "orientation": {"portrait": "portrait / vertical", "landscape": "landscape / horizontal"},
+    "nup": [1, 2, 4, 6, 9],
+    "copies": "1-99",
+    "page_range": "e.g. 1-3,5,8-10 or all",
+}
+
+# Max voice note duration (seconds)
+MAX_VOICE_DURATION = 60
 
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
