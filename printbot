@@ -5,13 +5,13 @@ set -euo pipefail
 # printbot — CLI tool for managing PrinterBot
 # ═══════════════════════════════════════════════════════════════════
 
-VERSION="2.0.0"
+VERSION="3.0.0"
 BOT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SERVICE_NAME="printer-bot"
 VENV_DIR="$BOT_DIR/venv"
 ENV_FILE="$BOT_DIR/.env"
-MIGRATION_DIR="$BOT_DIR/.migrations"
 VERSION_FILE="$BOT_DIR/.version"
+USERS_FILE="$BOT_DIR/.users"
 CLI_LINK="/usr/local/bin/printbot"
 
 # ── Colors ────────────────────────────────────────────────────────
@@ -19,15 +19,31 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info()    { echo -e "${BLUE}${BOLD}::${NC} $*"; }
 success() { echo -e "${GREEN}${BOLD}✓${NC} $*"; }
 warn()    { echo -e "${YELLOW}${BOLD}!${NC} $*"; }
 error()   { echo -e "${RED}${BOLD}✗${NC} $*" >&2; }
 step()    { echo -e "${BLUE}${BOLD}[$1/$2]${NC} $3"; }
+
+# ── Help system ───────────────────────────────────────────────────
+# Every command calls this at the top. If -h or --help is in args,
+# it prints help and exits. Otherwise continues.
+
+_wants_help() {
+    for arg in "$@"; do
+        if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Guards ────────────────────────────────────────────────────────
 
 _is_installed() {
     [ -d "$VENV_DIR" ] && [ -f "$ENV_FILE" ] && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null
@@ -40,7 +56,7 @@ _is_running() {
 _require_installed() {
     if ! _is_installed; then
         error "PrinterBot is not installed."
-        echo "  Run: printbot install"
+        echo "  Run: sudo printbot install"
         exit 1
     fi
 }
@@ -51,6 +67,15 @@ _require_root() {
         exit 1
     fi
 }
+
+_require_env() {
+    if [ ! -f "$ENV_FILE" ]; then
+        error ".env file not found at $ENV_FILE"
+        exit 1
+    fi
+}
+
+# ── Version tracking ─────────────────────────────────────────────
 
 _get_installed_version() {
     if [ -f "$VERSION_FILE" ]; then
@@ -64,16 +89,11 @@ _set_version() {
     echo "$VERSION" > "$VERSION_FILE"
 }
 
-# ── Migration system ─────────────────────────────────────────────
-# Each migration is a function named _migrate_FROM_TO
-# They run in order when the installed version is older than current
-
 _version_lt() {
-    # Returns 0 (true) if $1 < $2 using version comparison
     [ "$1" = "$2" ] && return 1
     local IFS=.
     local i ver1=($1) ver2=($2)
-    for ((i=0; i<${#ver1[@]}; i++)); do
+    for ((i=0; i<3; i++)); do
         if ((10#${ver1[i]:-0} < 10#${ver2[i]:-0})); then
             return 0
         elif ((10#${ver1[i]:-0} > 10#${ver2[i]:-0})); then
@@ -82,6 +102,135 @@ _version_lt() {
     done
     return 1
 }
+
+# ── Config registry ──────────────────────────────────────────────
+# Central source of truth for all config keys. Each key has:
+#   type:        required | optional
+#   secret:      yes | no (masked in 'config show')
+#   description: human-readable explanation
+#   default:     default value (empty = no default, must be provided)
+
+# Stored as parallel arrays because bash 4 associative arrays
+# don't preserve order and can't nest.
+
+_CONFIG_KEYS=(
+    "TELEGRAM_BOT_TOKEN"
+    "ALLOWED_USER_IDS"
+    "PRINTER_NAME"
+    "GEMINI_API_KEY"
+    "CUPS_POLL_INTERVAL"
+    "TEMP_DIR"
+)
+_CONFIG_TYPE=(
+    "required"
+    "required"
+    "required"
+    "optional"
+    "optional"
+    "optional"
+)
+_CONFIG_SECRET=(
+    "yes"
+    "no"
+    "no"
+    "yes"
+    "no"
+    "no"
+)
+_CONFIG_DESC=(
+    "Telegram bot token from @BotFather"
+    "Comma-separated Telegram user IDs allowed to use the bot"
+    "CUPS printer name (see: lpstat -p)"
+    "Google Gemini API key for voice notes (https://aistudio.google.com/apikey)"
+    "Seconds between CUPS status polls (default: 3)"
+    "Temp file directory (default: /tmp/printer_bot)"
+)
+_CONFIG_DEFAULT=(
+    ""
+    ""
+    ""
+    ""
+    "3"
+    "/tmp/printer_bot"
+)
+
+_config_index() {
+    # Returns the index of a key, or 255 if not found
+    local key="$1"
+    for i in "${!_CONFIG_KEYS[@]}"; do
+        if [ "${_CONFIG_KEYS[$i]}" = "$key" ]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_config_get() {
+    # Read a value from .env. Returns empty string if not set.
+    local key="$1"
+    if [ -f "$ENV_FILE" ]; then
+        grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
+    fi
+}
+
+_config_set_value() {
+    # Set a key=value in .env (create or update)
+    local key="$1" val="$2"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+    else
+        echo "${key}=${val}" >> "$ENV_FILE"
+    fi
+}
+
+_config_remove() {
+    local key="$1"
+    sed -i "/^${key}=/d" "$ENV_FILE"
+}
+
+# ── User management helpers ──────────────────────────────────────
+
+_get_user_ids() {
+    # Returns ALLOWED_USER_IDS as newline-separated list
+    local ids
+    ids=$(_config_get "ALLOWED_USER_IDS")
+    echo "$ids" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$'
+}
+
+_set_user_ids() {
+    # Takes newline-separated list, writes as comma-separated to .env
+    local ids
+    ids=$(echo "$1" | tr '\n' ',' | sed 's/,$//')
+    _config_set_value "ALLOWED_USER_IDS" "$ids"
+}
+
+_get_user_label() {
+    # Get label for a user ID from .users file
+    local uid="$1"
+    if [ -f "$USERS_FILE" ]; then
+        grep "^${uid}:" "$USERS_FILE" 2>/dev/null | head -1 | cut -d: -f2- || true
+    fi
+}
+
+_set_user_label() {
+    local uid="$1" label="$2"
+    touch "$USERS_FILE"
+    # Remove existing entry
+    sed -i "/^${uid}:/d" "$USERS_FILE"
+    if [ -n "$label" ]; then
+        echo "${uid}:${label}" >> "$USERS_FILE"
+    fi
+}
+
+_remove_user_label() {
+    local uid="$1"
+    if [ -f "$USERS_FILE" ]; then
+        sed -i "/^${uid}:/d" "$USERS_FILE"
+    fi
+}
+
+# ── Migration system ─────────────────────────────────────────────
 
 _run_migrations() {
     local old_ver="$(_get_installed_version)"
@@ -92,21 +241,20 @@ _run_migrations() {
 
     info "Migrating from v$old_ver to v$VERSION..."
 
-    # Migration: 0.0.0 -> 1.0.0 (legacy setup.sh installs)
+    # 0.0.0 -> 1.0.0: legacy setup.sh installs
     if _version_lt "$old_ver" "1.0.0"; then
         info "Migration: registering CLI tool..."
-        # Nothing special needed, install handles it
     fi
 
-    # Migration: 1.0.0 -> 2.0.0 (add Gemini support)
+    # 1.0.0 -> 2.0.0: add Gemini support
     if _version_lt "$old_ver" "2.0.0"; then
         if [ -f "$ENV_FILE" ] && ! grep -q "GEMINI_API_KEY" "$ENV_FILE"; then
             echo ""
             warn "New feature: Voice notes via Google Gemini AI"
             echo "  Get a free API key at: https://aistudio.google.com/apikey"
-            read -rp "  Gemini API key (press Enter to skip): " GEMINI_KEY
+            read -rp "  Gemini API key (Enter to skip): " GEMINI_KEY
             if [ -n "$GEMINI_KEY" ]; then
-                echo "GEMINI_API_KEY=$GEMINI_KEY" >> "$ENV_FILE"
+                _config_set_value "GEMINI_API_KEY" "$GEMINI_KEY"
                 success "Gemini API key added."
             else
                 echo "  Skipped. Voice notes will be disabled."
@@ -114,77 +262,29 @@ _run_migrations() {
         fi
     fi
 
-    # Add future migrations here:
-    # if _version_lt "$old_ver" "3.0.0"; then
-    #     info "Migration: ..."
-    # fi
+    # 2.0.0 -> 3.0.0: multi-user support, .users file
+    if _version_lt "$old_ver" "3.0.0"; then
+        # Create .users file from existing ALLOWED_USER_IDS
+        if [ ! -f "$USERS_FILE" ]; then
+            touch "$USERS_FILE"
+            info "Migration: created user labels file (.users)"
+            echo "  Tip: add names with 'printbot user label <ID> <name>'"
+        fi
+    fi
+
+    # Future: if _version_lt "$old_ver" "4.0.0"; then ... fi
 
     _set_version
     success "Migration complete."
 }
 
-# ── env management ────────────────────────────────────────────────
-
-# Required env vars and their prompts
-declare -A ENV_REQUIRED=(
-    ["TELEGRAM_BOT_TOKEN"]="Telegram bot token (from @BotFather)"
-    ["ALLOWED_USER_IDS"]="Your Telegram user ID (from @userinfobot)"
-    ["PRINTER_NAME"]="Printer name in CUPS"
-)
-
-# Optional env vars
-declare -A ENV_OPTIONAL=(
-    ["GEMINI_API_KEY"]="Gemini API key (for voice notes, https://aistudio.google.com/apikey)"
-)
-
-_prompt_env_vars() {
-    local detected_printer
-    detected_printer=$(lpstat -p 2>/dev/null | head -1 | awk '{print $2}' || echo "HP_Smart_Tank_725")
-
-    echo ""
-    info "Bot configuration"
-    echo ""
-
-    read -rp "  Telegram bot token (from @BotFather): " BOT_TOKEN
-    read -rp "  Your Telegram user ID (from @userinfobot): " USER_IDS
-
-    echo ""
-    info "Optional features"
-    echo "  Get a free Gemini key at: https://aistudio.google.com/apikey"
-    read -rp "  Gemini API key (Enter to skip): " GEMINI_KEY
-
-    {
-        echo "TELEGRAM_BOT_TOKEN=$BOT_TOKEN"
-        echo "ALLOWED_USER_IDS=$USER_IDS"
-        echo "PRINTER_NAME=$detected_printer"
-        [ -n "$GEMINI_KEY" ] && echo "GEMINI_API_KEY=$GEMINI_KEY"
-    } > "$ENV_FILE"
-
-    chmod 600 "$ENV_FILE"
-    success ".env created."
-}
-
-_check_missing_env() {
-    # Check for new optional vars not yet in .env
-    local added=0
-    for key in "${!ENV_OPTIONAL[@]}"; do
-        if ! grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-            echo ""
-            warn "New optional config: $key"
-            read -rp "  ${ENV_OPTIONAL[$key]} (Enter to skip): " val
-            if [ -n "$val" ]; then
-                echo "${key}=${val}" >> "$ENV_FILE"
-                success "$key added."
-                added=1
-            fi
-        fi
-    done
-    return 0
-}
-
-# ── Install service ───────────────────────────────────────────────
+# ── Service file ─────────────────────────────────────────────────
 
 _install_service() {
+    local run_user="${SUDO_USER:-$USER}"
+    local run_group
+    run_group=$(id -gn "$run_user")
+
     sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<SERVICEEOF
 [Unit]
 Description=Telegram Printer Bot
@@ -193,8 +293,8 @@ Wants=network-online.target cups.service
 
 [Service]
 Type=simple
-User=$SUDO_USER
-Group=$(id -gn "$SUDO_USER")
+User=$run_user
+Group=$run_group
 WorkingDirectory=$BOT_DIR
 ExecStart=$VENV_DIR/bin/python3 $BOT_DIR/bot.py
 Restart=always
@@ -212,14 +312,37 @@ WantedBy=multi-user.target
 SERVICEEOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable "$SERVICE_NAME"
+    sudo systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+}
+
+# ── Restart hint ─────────────────────────────────────────────────
+
+_hint_restart() {
+    echo ""
+    warn "Restart for changes to take effect:"
+    echo "  sudo printbot restart"
 }
 
 # ═══════════════════════════════════════════════════════════════════
-# Commands
+# COMMANDS
 # ═══════════════════════════════════════════════════════════════════
 
+# ── install ───────────────────────────────────────────────────────
+
 cmd_install() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot install"
+        echo ""
+        echo "First-time setup. Installs system packages, CUPS, printer"
+        echo "drivers, Python environment, configures the bot, and starts"
+        echo "the systemd service."
+        echo ""
+        echo "After install, 'printbot' is available globally in PATH."
+        echo ""
+        echo "If already installed, use 'sudo printbot update' instead."
+        return 0
+    fi
+
     _require_root
 
     if _is_installed; then
@@ -233,7 +356,6 @@ cmd_install() {
     echo -e "${BOLD}PrinterBot Installer${NC}"
     echo ""
 
-    # 1. System packages
     step 1 7 "Installing system packages..."
     apt update -qq
     apt install -y -qq \
@@ -245,13 +367,11 @@ cmd_install() {
         gcc > /dev/null
     success "System packages installed."
 
-    # 2. CUPS
     step 2 7 "Configuring CUPS..."
     systemctl enable --now cups > /dev/null 2>&1
     usermod -aG lpadmin "$SUDO_USER"
     success "CUPS configured."
 
-    # 3. Printer
     step 3 7 "Setting up printer..."
     if lpstat -p 2>/dev/null | grep -qi "hp"; then
         echo "  HP printer already detected:"
@@ -271,34 +391,62 @@ cmd_install() {
     fi
     success "Printer configured."
 
-    # 4. Python
     step 4 7 "Setting up Python environment..."
     python3 -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --upgrade pip -q
     "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" -q
     success "Python packages installed."
 
-    # 5. Config
     step 5 7 "Configuring bot..."
-    _prompt_env_vars
+    local detected_printer
+    detected_printer=$(lpstat -p 2>/dev/null | head -1 | awk '{print $2}' || echo "HP_Smart_Tank_725")
 
-    # 6. Temp dir
+    echo ""
+    info "Bot configuration"
+    echo ""
+    read -rp "  Telegram bot token (from @BotFather): " BOT_TOKEN
+    echo ""
+    echo "  You can add multiple Telegram user IDs, comma-separated."
+    echo "  Get your ID from @userinfobot on Telegram."
+    read -rp "  Allowed user IDs: " USER_IDS
+    echo ""
+    info "Optional features"
+    echo "  Get a free Gemini key at: https://aistudio.google.com/apikey"
+    read -rp "  Gemini API key (Enter to skip): " GEMINI_KEY
+
+    {
+        echo "TELEGRAM_BOT_TOKEN=$BOT_TOKEN"
+        echo "ALLOWED_USER_IDS=$USER_IDS"
+        echo "PRINTER_NAME=$detected_printer"
+        [ -n "${GEMINI_KEY:-}" ] && echo "GEMINI_API_KEY=$GEMINI_KEY"
+    } > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    # Create .users with labels
+    touch "$USERS_FILE"
+    echo ""
+    info "Name your users (optional, for 'printbot user list')"
+    IFS=',' read -ra id_arr <<< "$USER_IDS"
+    for uid in "${id_arr[@]}"; do
+        uid=$(echo "$uid" | tr -d ' ')
+        [ -z "$uid" ] && continue
+        read -rp "  Name for user $uid (Enter to skip): " uname
+        if [ -n "$uname" ]; then
+            _set_user_label "$uid" "$uname"
+        fi
+    done
+
+    success ".env created."
+
     step 6 7 "Creating temp directory..."
     mkdir -p /tmp/printer_bot
     success "Done."
 
-    # 7. Service + CLI
     step 7 7 "Installing service and CLI..."
     _install_service
-
-    # Symlink CLI to PATH
     ln -sf "$BOT_DIR/printbot" "$CLI_LINK"
     chmod +x "$BOT_DIR/printbot"
-
-    # Set version
     _set_version
-
-    # Start
     systemctl start "$SERVICE_NAME"
     success "Service started."
 
@@ -311,14 +459,24 @@ cmd_install() {
     echo -e "  ${DIM}Type 'printbot help' for all commands.${NC}"
 }
 
+# ── update ────────────────────────────────────────────────────────
+
 cmd_update() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot update"
+        echo ""
+        echo "Pulls latest code from git, updates Python packages,"
+        echo "runs version migrations (prompts for new config if needed),"
+        echo "refreshes the systemd service, and restarts the bot."
+        return 0
+    fi
+
     _require_root
     _require_installed
 
     echo -e "${BOLD}Updating PrinterBot...${NC}"
     echo ""
 
-    # Pull from git
     if [ -d "$BOT_DIR/.git" ]; then
         info "Pulling latest code..."
         cd "$BOT_DIR"
@@ -331,7 +489,6 @@ cmd_update() {
             git pull origin main
             success "Code updated."
 
-            # Re-exec if printbot script itself changed
             if git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -q "^printbot$"; then
                 info "CLI tool updated. Re-running..."
                 exec "$BOT_DIR/printbot" update
@@ -341,19 +498,14 @@ cmd_update() {
         fi
     fi
 
-    # Update Python packages
     info "Updating Python packages..."
     "$VENV_DIR/bin/pip" install --upgrade pip -q
     "$VENV_DIR/bin/pip" install -r "$BOT_DIR/requirements.txt" --upgrade -q
     success "Packages updated."
 
-    # Run migrations (prompts for new env vars etc.)
     _run_migrations
-
-    # Refresh service file
     _install_service
 
-    # Restart
     systemctl restart "$SERVICE_NAME"
     success "Service restarted."
 
@@ -361,13 +513,26 @@ cmd_update() {
     echo -e "${GREEN}${BOLD}Update complete!${NC}"
 }
 
+# ── uninstall ─────────────────────────────────────────────────────
+
 cmd_uninstall() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot uninstall"
+        echo ""
+        echo "Stops the bot, removes the systemd service, deletes the"
+        echo "Python virtual environment, and removes the CLI from PATH."
+        echo ""
+        echo "Your .env, .users, and bot source code are preserved."
+        echo "To remove everything: rm -rf $BOT_DIR"
+        return 0
+    fi
+
     _require_root
     _require_installed
 
     echo -e "${BOLD}Uninstalling PrinterBot...${NC}"
     echo ""
-    read -rp "  Are you sure? This will stop the bot and remove the service. (y/N): " CONFIRM
+    read -rp "  Are you sure? This stops the bot and removes the service. (y/N): " CONFIRM
     if [[ "${CONFIRM,,}" != "y" ]]; then
         echo "  Aborted."
         exit 0
@@ -392,12 +557,19 @@ cmd_uninstall() {
 
     echo ""
     success "Uninstalled."
-    echo ""
-    echo "  Your .env and bot code are still in: $BOT_DIR"
-    echo "  To remove everything: rm -rf $BOT_DIR"
+    echo "  Your .env and code are still in: $BOT_DIR"
 }
 
+# ── start / stop / restart ────────────────────────────────────────
+
 cmd_start() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot start"
+        echo ""
+        echo "Start the PrinterBot service."
+        return 0
+    fi
+
     _require_root
     _require_installed
 
@@ -411,6 +583,14 @@ cmd_start() {
 }
 
 cmd_stop() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot stop"
+        echo ""
+        echo "Stop the PrinterBot service. It will not restart until"
+        echo "you run 'printbot start' or reboot (auto-start is kept)."
+        return 0
+    fi
+
     _require_root
     _require_installed
 
@@ -424,6 +604,13 @@ cmd_stop() {
 }
 
 cmd_restart() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot restart"
+        echo ""
+        echo "Restart the PrinterBot service. Use after config changes."
+        return 0
+    fi
+
     _require_root
     _require_installed
 
@@ -431,48 +618,57 @@ cmd_restart() {
     success "Bot restarted."
 }
 
+# ── status ────────────────────────────────────────────────────────
+
 cmd_status() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot status"
+        echo ""
+        echo "Show bot service status, version, git info, uptime,"
+        echo "printer status, and config location."
+        echo "Also checks if updates are available."
+        return 0
+    fi
+
     _require_installed
 
     echo -e "${BOLD}PrinterBot Status${NC}"
     echo ""
 
-    # Service status
     if _is_running; then
         echo -e "  Service:  ${GREEN}running${NC}"
     else
         echo -e "  Service:  ${RED}stopped${NC}"
     fi
 
-    # Version
     echo -e "  Version:  $(_get_installed_version)"
 
-    # Git info
     if [ -d "$BOT_DIR/.git" ]; then
         local commit
         commit=$(git -C "$BOT_DIR" log -1 --format="%h %s" 2>/dev/null || echo "unknown")
         echo -e "  Commit:   ${DIM}$commit${NC}"
 
-        # Check for updates
         git -C "$BOT_DIR" fetch origin 2>/dev/null || true
         local LOCAL REMOTE
         LOCAL=$(git -C "$BOT_DIR" rev-parse HEAD 2>/dev/null || echo "")
         REMOTE=$(git -C "$BOT_DIR" rev-parse origin/main 2>/dev/null || echo "")
         if [ -n "$LOCAL" ] && [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
-            echo -e "  Updates:  ${YELLOW}available${NC} (run: sudo printbot update)"
+            echo -e "  Updates:  ${YELLOW}available${NC} (sudo printbot update)"
         else
             echo -e "  Updates:  ${GREEN}up to date${NC}"
         fi
     fi
 
-    # Uptime
     if _is_running; then
         local uptime
         uptime=$(systemctl show "$SERVICE_NAME" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "")
-        if [ -n "$uptime" ]; then
-            echo -e "  Since:    $uptime"
-        fi
+        [ -n "$uptime" ] && echo -e "  Since:    $uptime"
     fi
+
+    # Users
+    local user_count
+    user_count=$(_get_user_ids | wc -l)
+    echo -e "  Users:    ${user_count} authorized"
 
     # Printer
     echo ""
@@ -484,63 +680,196 @@ cmd_status() {
         echo -e "  Printer:  ${RED}not detected${NC}"
     fi
 
-    # Config
     echo ""
     echo -e "  Config:   $ENV_FILE"
     echo -e "  Install:  $BOT_DIR"
     echo ""
 }
 
+# ── logs ──────────────────────────────────────────────────────────
+
 cmd_logs() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot logs [OPTIONS]"
+        echo ""
+        echo "Options:"
+        echo "  -f, --follow    Follow logs in real time"
+        echo "  <N>             Show last N lines (default: 50)"
+        echo "  --error         Show only error lines"
+        echo "  --today         Show only today's logs"
+        echo ""
+        echo "Examples:"
+        echo "  printbot logs           Show last 50 lines"
+        echo "  printbot logs -f        Follow live output"
+        echo "  printbot logs 200       Show last 200 lines"
+        echo "  printbot logs --error   Show errors only"
+        echo "  printbot logs --today   Show today's logs"
+        return 0
+    fi
+
     _require_installed
 
-    local lines="${1:-50}"
-    local follow="${2:-}"
+    local arg="${1:-50}"
 
-    if [ "$lines" = "-f" ] || [ "$lines" = "--follow" ]; then
-        journalctl -u "$SERVICE_NAME" -f --no-hostname
-    else
-        journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager --no-hostname
-        echo ""
-        echo -e "${DIM}Showing last $lines lines. Use 'printbot logs -f' for live output.${NC}"
-    fi
+    case "$arg" in
+        -f|--follow)
+            journalctl -u "$SERVICE_NAME" -f --no-hostname
+            ;;
+        --error)
+            journalctl -u "$SERVICE_NAME" -p err --no-pager --no-hostname -n 100
+            ;;
+        --today)
+            journalctl -u "$SERVICE_NAME" --since today --no-pager --no-hostname
+            ;;
+        *)
+            journalctl -u "$SERVICE_NAME" -n "$arg" --no-pager --no-hostname
+            echo ""
+            echo -e "${DIM}Showing last $arg lines. Use 'printbot logs -f' to follow.${NC}"
+            ;;
+    esac
 }
 
+# ── config ────────────────────────────────────────────────────────
+
 cmd_config() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot config <action>"
+        echo ""
+        echo "Actions:"
+        echo "  show             Show all config values (secrets masked)"
+        echo "  edit             Open .env in your editor"
+        echo "  set KEY=VALUE    Set a config value"
+        echo "  get KEY          Get a config value (unmasked)"
+        echo "  remove KEY       Remove a config key"
+        echo "  keys             List all known config keys with descriptions"
+        echo ""
+        echo "Known config keys:"
+        for i in "${!_CONFIG_KEYS[@]}"; do
+            local req="${_CONFIG_TYPE[$i]}"
+            local tag
+            if [ "$req" = "required" ]; then
+                tag="${RED}required${NC}"
+            else
+                tag="${DIM}optional${NC}"
+            fi
+            echo -e "  ${BOLD}${_CONFIG_KEYS[$i]}${NC} ($tag)"
+            echo -e "    ${_CONFIG_DESC[$i]}"
+            if [ -n "${_CONFIG_DEFAULT[$i]}" ]; then
+                echo -e "    Default: ${_CONFIG_DEFAULT[$i]}"
+            fi
+        done
+        echo ""
+        echo "Examples:"
+        echo "  printbot config"
+        echo "  printbot config get PRINTER_NAME"
+        echo "  sudo printbot config set PRINTER_NAME=HP_DeskJet"
+        echo "  sudo printbot config set GEMINI_API_KEY=AIza..."
+        echo "  sudo printbot config remove GEMINI_API_KEY"
+        echo "  sudo printbot config edit"
+        return 0
+    fi
+
     _require_installed
+    _require_env
     local action="${1:-show}"
 
     case "$action" in
-        show)
-            echo -e "${BOLD}Current configuration:${NC}"
+        show|list)
+            echo -e "${BOLD}Configuration${NC}  ${DIM}($ENV_FILE)${NC}"
             echo ""
+
+            for i in "${!_CONFIG_KEYS[@]}"; do
+                local key="${_CONFIG_KEYS[$i]}"
+                local secret="${_CONFIG_SECRET[$i]}"
+                local req="${_CONFIG_TYPE[$i]}"
+                local desc="${_CONFIG_DESC[$i]}"
+                local value
+                value=$(_config_get "$key")
+
+                local display
+                if [ -z "$value" ]; then
+                    if [ "$req" = "required" ]; then
+                        display="${RED}(not set)${NC}"
+                    else
+                        local def="${_CONFIG_DEFAULT[$i]}"
+                        if [ -n "$def" ]; then
+                            display="${DIM}(default: $def)${NC}"
+                        else
+                            display="${DIM}(not set)${NC}"
+                        fi
+                    fi
+                elif [ "$secret" = "yes" ]; then
+                    display="${DIM}${value:0:8}...${NC}"
+                else
+                    display="$value"
+                fi
+
+                # Type badge
+                local badge
+                if [ "$req" = "required" ]; then
+                    badge=""
+                else
+                    badge=" ${DIM}(optional)${NC}"
+                fi
+
+                echo -e "  ${BOLD}$key${NC}${badge}"
+                echo -e "    $display"
+                echo -e "    ${DIM}$desc${NC}"
+                echo ""
+            done
+
+            # Show any unknown keys in .env
+            local unknown_found=0
             while IFS='=' read -r key value; do
                 [[ "$key" =~ ^#.*$ ]] && continue
                 [ -z "$key" ] && continue
-                # Mask sensitive values
-                if [[ "$key" == *TOKEN* ]] || [[ "$key" == *KEY* ]]; then
-                    local masked="${value:0:8}..."
-                    echo -e "  ${BOLD}$key${NC} = ${DIM}$masked${NC}"
-                else
-                    echo -e "  ${BOLD}$key${NC} = $value"
+                if ! _config_index "$key" > /dev/null 2>&1; then
+                    if [ $unknown_found -eq 0 ]; then
+                        echo -e "  ${YELLOW}Unknown keys:${NC}"
+                        unknown_found=1
+                    fi
+                    echo -e "    ${key} = ${value}"
                 fi
             done < "$ENV_FILE"
-            echo ""
-            echo -e "${DIM}Edit: sudo printbot config edit${NC}"
-            echo -e "${DIM}Set:  sudo printbot config set KEY=VALUE${NC}"
+            [ $unknown_found -eq 1 ] && echo ""
+
+            echo -e "${DIM}  Edit:   sudo printbot config edit"
+            echo -e "  Set:    sudo printbot config set KEY=VALUE"
+            echo -e "  Keys:   printbot config --help${NC}"
             ;;
-        edit)
-            _require_root
-            "${EDITOR:-nano}" "$ENV_FILE"
-            echo ""
-            warn "Restart the bot for changes to take effect:"
-            echo "  sudo printbot restart"
+
+        get)
+            shift
+            if [ $# -eq 0 ]; then
+                error "Usage: printbot config get KEY"
+                exit 1
+            fi
+            local key="$1"
+            local value
+            value=$(_config_get "$key")
+            if [ -n "$value" ]; then
+                echo "$value"
+            else
+                # Check if there's a default
+                if _config_index "$key" > /dev/null 2>&1; then
+                    local idx
+                    idx=$(_config_index "$key")
+                    local def="${_CONFIG_DEFAULT[$idx]}"
+                    if [ -n "$def" ]; then
+                        echo "$def"
+                        return 0
+                    fi
+                fi
+                error "$key is not set."
+                exit 1
+            fi
             ;;
+
         set)
             _require_root
             shift
             if [ $# -eq 0 ]; then
-                error "Usage: printbot config set KEY=VALUE"
+                error "Usage: sudo printbot config set KEY=VALUE"
                 exit 1
             fi
             local pair="$1"
@@ -548,82 +877,437 @@ cmd_config() {
             local val="${pair#*=}"
 
             if [ "$key" = "$pair" ]; then
-                error "Usage: printbot config set KEY=VALUE"
+                error "Usage: sudo printbot config set KEY=VALUE"
                 exit 1
             fi
 
-            # Remove existing key if present
-            if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-                sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+            # Warn about unknown keys
+            if ! _config_index "$key" > /dev/null 2>&1; then
+                warn "Unknown config key: $key"
+                read -rp "  Add anyway? (y/N): " confirm
+                if [[ "${confirm,,}" != "y" ]]; then
+                    echo "  Aborted. Run 'printbot config --help' to see known keys."
+                    exit 0
+                fi
+            fi
+
+            # Validate ALLOWED_USER_IDS format
+            if [ "$key" = "ALLOWED_USER_IDS" ]; then
+                if ! echo "$val" | grep -qP '^\d+(,\d+)*$'; then
+                    error "ALLOWED_USER_IDS must be comma-separated numbers."
+                    echo "  Example: 123456789,987654321"
+                    exit 1
+                fi
+            fi
+
+            local existed
+            existed=$(grep -c "^${key}=" "$ENV_FILE" 2>/dev/null || echo "0")
+            _config_set_value "$key" "$val"
+
+            if [ "$existed" -gt 0 ]; then
                 success "Updated $key."
             else
-                echo "${key}=${val}" >> "$ENV_FILE"
                 success "Added $key."
             fi
-            echo ""
-            warn "Restart the bot for changes to take effect:"
-            echo "  sudo printbot restart"
+            _hint_restart
             ;;
+
+        remove|rm|delete)
+            _require_root
+            shift
+            if [ $# -eq 0 ]; then
+                error "Usage: sudo printbot config remove KEY"
+                exit 1
+            fi
+            local key="$1"
+
+            # Block removing required keys
+            if _config_index "$key" > /dev/null 2>&1; then
+                local idx
+                idx=$(_config_index "$key")
+                if [ "${_CONFIG_TYPE[$idx]}" = "required" ]; then
+                    error "Cannot remove required config key: $key"
+                    exit 1
+                fi
+            fi
+
+            if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+                _config_remove "$key"
+                success "Removed $key."
+                _hint_restart
+            else
+                warn "$key is not set."
+            fi
+            ;;
+
+        keys)
+            echo -e "${BOLD}Known config keys:${NC}"
+            echo ""
+            for i in "${!_CONFIG_KEYS[@]}"; do
+                local req="${_CONFIG_TYPE[$i]}"
+                local tag
+                if [ "$req" = "required" ]; then
+                    tag="${RED}required${NC}"
+                else
+                    tag="${DIM}optional${NC}"
+                fi
+                echo -e "  ${BOLD}${_CONFIG_KEYS[$i]}${NC} ($tag)"
+                echo -e "    ${_CONFIG_DESC[$i]}"
+                if [ -n "${_CONFIG_DEFAULT[$i]}" ]; then
+                    echo -e "    ${DIM}Default: ${_CONFIG_DEFAULT[$i]}${NC}"
+                fi
+            done
+            echo ""
+            ;;
+
+        edit)
+            _require_root
+            "${EDITOR:-nano}" "$ENV_FILE"
+            _hint_restart
+            ;;
+
         *)
             error "Unknown config action: $action"
-            echo "  Usage: printbot config [show|edit|set KEY=VALUE]"
+            echo "  Run 'printbot config --help' for usage."
             exit 1
             ;;
     esac
 }
 
-cmd_printer() {
-    echo -e "${BOLD}Printer Info${NC}"
-    echo ""
+# ── user ──────────────────────────────────────────────────────────
 
-    local printers
-    printers=$(lpstat -p 2>/dev/null || echo "")
-    if [ -z "$printers" ]; then
-        error "No printers found in CUPS."
-        echo "  Run: sudo printbot printer setup"
-        return 1
-    fi
-
-    echo "$printers" | while IFS= read -r line; do
-        if echo "$line" | grep -qi "idle"; then
-            echo -e "  ${GREEN}$line${NC}"
-        elif echo "$line" | grep -qi "printing"; then
-            echo -e "  ${BLUE}$line${NC}"
-        else
-            echo -e "  ${YELLOW}$line${NC}"
-        fi
-    done
-
-    echo ""
-
-    # Queue
-    local queue
-    queue=$(lpstat -o 2>/dev/null || echo "")
-    if [ -n "$queue" ]; then
-        echo -e "${BOLD}Print Queue:${NC}"
-        echo "$queue" | sed 's/^/  /'
-    else
-        echo -e "${DIM}Print queue is empty.${NC}"
-    fi
-
-    # Handle subcommand
-    local action="${1:-}"
-    if [ "$action" = "setup" ]; then
-        _require_root
+cmd_user() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot user <action>"
         echo ""
-        info "Running HP printer setup..."
-        hp-setup -i
+        echo "Manage Telegram users authorized to use the bot."
+        echo ""
+        echo "Actions:"
+        echo "  list                   List all authorized users"
+        echo "  add <ID> [--name N]    Authorize a new user"
+        echo "  remove <ID>            Remove a user's access"
+        echo "  label <ID> <name>      Set or update a user's display name"
+        echo ""
+        echo "Examples:"
+        echo "  printbot user list"
+        echo "  sudo printbot user add 123456789 --name Mohamed"
+        echo "  sudo printbot user add 987654321"
+        echo "  sudo printbot user remove 987654321"
+        echo "  sudo printbot user label 123456789 Ahmed"
+        echo ""
+        echo "Get your Telegram user ID from @userinfobot on Telegram."
+        return 0
     fi
+
+    _require_installed
+    _require_env
+    local action="${1:-list}"
+
+    case "$action" in
+        list|ls)
+            echo -e "${BOLD}Authorized Users${NC}"
+            echo ""
+            local ids
+            ids=$(_get_user_ids)
+            if [ -z "$ids" ]; then
+                warn "No users configured."
+                echo "  Add one: sudo printbot user add <TELEGRAM_ID>"
+                return 0
+            fi
+
+            local count=0
+            while IFS= read -r uid; do
+                [ -z "$uid" ] && continue
+                local label
+                label=$(_get_user_label "$uid")
+                count=$((count + 1))
+                if [ -n "$label" ]; then
+                    echo -e "  ${GREEN}$uid${NC}  $label"
+                else
+                    echo -e "  ${GREEN}$uid${NC}  ${DIM}(no name)${NC}"
+                fi
+            done <<< "$ids"
+
+            echo ""
+            echo -e "  ${DIM}$count user(s) total${NC}"
+            echo ""
+            echo -e "${DIM}  Add:    sudo printbot user add <ID> --name <name>"
+            echo -e "  Remove: sudo printbot user remove <ID>${NC}"
+            ;;
+
+        add)
+            _require_root
+            shift
+            if [ $# -eq 0 ]; then
+                error "Usage: sudo printbot user add <ID> [--name <name>]"
+                exit 1
+            fi
+
+            local new_id="$1"
+            shift
+
+            # Validate ID is numeric
+            if ! [[ "$new_id" =~ ^[0-9]+$ ]]; then
+                error "User ID must be a number. Got: $new_id"
+                echo "  Get your Telegram ID from @userinfobot"
+                exit 1
+            fi
+
+            # Check if already exists
+            if _get_user_ids | grep -qx "$new_id"; then
+                warn "User $new_id is already authorized."
+                return 0
+            fi
+
+            # Parse --name
+            local name=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --name|-n)
+                        shift
+                        name="$*"
+                        break
+                        ;;
+                    *)
+                        name="$*"
+                        break
+                        ;;
+                esac
+            done
+
+            # Add to ALLOWED_USER_IDS
+            local current
+            current=$(_config_get "ALLOWED_USER_IDS")
+            if [ -n "$current" ]; then
+                _config_set_value "ALLOWED_USER_IDS" "${current},${new_id}"
+            else
+                _config_set_value "ALLOWED_USER_IDS" "$new_id"
+            fi
+
+            # Save label
+            if [ -n "$name" ]; then
+                _set_user_label "$new_id" "$name"
+                success "Added user $new_id ($name)."
+            else
+                success "Added user $new_id."
+                echo -e "  ${DIM}Tip: printbot user label $new_id <name>${NC}"
+            fi
+
+            _hint_restart
+            ;;
+
+        remove|rm|delete)
+            _require_root
+            shift
+            if [ $# -eq 0 ]; then
+                error "Usage: sudo printbot user remove <ID>"
+                exit 1
+            fi
+
+            local rm_id="$1"
+
+            if ! _get_user_ids | grep -qx "$rm_id"; then
+                error "User $rm_id is not in the authorized list."
+                return 1
+            fi
+
+            # Check if this is the last user
+            local count
+            count=$(_get_user_ids | wc -l)
+            if [ "$count" -le 1 ]; then
+                error "Cannot remove the last user. At least one user must be authorized."
+                exit 1
+            fi
+
+            # Remove from list
+            local new_list
+            new_list=$(_get_user_ids | grep -vx "$rm_id" | tr '\n' ',' | sed 's/,$//')
+            _config_set_value "ALLOWED_USER_IDS" "$new_list"
+
+            # Remove label
+            _remove_user_label "$rm_id"
+
+            local label
+            label=$(_get_user_label "$rm_id")
+            if [ -n "$label" ]; then
+                success "Removed user $rm_id ($label)."
+            else
+                success "Removed user $rm_id."
+            fi
+
+            _hint_restart
+            ;;
+
+        label|name|rename)
+            _require_root
+            shift
+            if [ $# -lt 2 ]; then
+                error "Usage: sudo printbot user label <ID> <name>"
+                exit 1
+            fi
+
+            local uid="$1"
+            shift
+            local name="$*"
+
+            if ! _get_user_ids | grep -qx "$uid"; then
+                error "User $uid is not in the authorized list."
+                echo "  Add them first: sudo printbot user add $uid --name $name"
+                return 1
+            fi
+
+            _set_user_label "$uid" "$name"
+            success "User $uid labeled as: $name"
+            ;;
+
+        *)
+            error "Unknown user action: $action"
+            echo "  Run 'printbot user --help' for usage."
+            exit 1
+            ;;
+    esac
 }
 
+# ── printer ───────────────────────────────────────────────────────
+
+cmd_printer() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot printer [action]"
+        echo ""
+        echo "Actions:"
+        echo "  (none)    Show printer status and print queue"
+        echo "  setup     Run HP printer setup wizard (requires sudo)"
+        echo "  test      Print a test page"
+        echo "  queue     Show print queue only"
+        echo "  cancel    Cancel all print jobs"
+        echo ""
+        echo "Examples:"
+        echo "  printbot printer"
+        echo "  sudo printbot printer setup"
+        echo "  sudo printbot printer test"
+        echo "  sudo printbot printer cancel"
+        return 0
+    fi
+
+    local action="${1:-show}"
+
+    case "$action" in
+        show)
+            echo -e "${BOLD}Printer${NC}"
+            echo ""
+
+            local printers
+            printers=$(lpstat -p 2>/dev/null || echo "")
+            if [ -z "$printers" ]; then
+                error "No printers found in CUPS."
+                echo "  Run: sudo printbot printer setup"
+                return 1
+            fi
+
+            echo "$printers" | while IFS= read -r line; do
+                if echo "$line" | grep -qi "idle"; then
+                    echo -e "  ${GREEN}$line${NC}"
+                elif echo "$line" | grep -qi "printing"; then
+                    echo -e "  ${BLUE}$line${NC}"
+                else
+                    echo -e "  ${YELLOW}$line${NC}"
+                fi
+            done
+            echo ""
+
+            local queue
+            queue=$(lpstat -o 2>/dev/null || echo "")
+            if [ -n "$queue" ]; then
+                echo -e "${BOLD}Print Queue:${NC}"
+                echo "$queue" | sed 's/^/  /'
+            else
+                echo -e "  ${DIM}Print queue is empty.${NC}"
+            fi
+            echo ""
+            ;;
+
+        setup)
+            _require_root
+            info "Running HP printer setup..."
+            hp-setup -i
+            echo ""
+            info "Printers now available:"
+            lpstat -p 2>/dev/null | sed 's/^/  /'
+            echo ""
+            echo "  Update config: sudo printbot config set PRINTER_NAME=<name>"
+            ;;
+
+        test)
+            _require_root
+            local printer_name
+            printer_name=$(_config_get "PRINTER_NAME")
+            if [ -z "$printer_name" ]; then
+                printer_name=$(lpstat -d 2>/dev/null | awk '{print $NF}' || echo "")
+            fi
+            if [ -z "$printer_name" ]; then
+                error "No printer configured."
+                return 1
+            fi
+            info "Printing test page on $printer_name..."
+            lp -d "$printer_name" /usr/share/cups/data/testprint 2>/dev/null \
+                || echo "Test page sent (check printer)."
+            success "Test page sent."
+            ;;
+
+        queue)
+            local queue
+            queue=$(lpstat -o 2>/dev/null || echo "")
+            if [ -n "$queue" ]; then
+                echo "$queue"
+            else
+                echo "Print queue is empty."
+            fi
+            ;;
+
+        cancel)
+            _require_root
+            cancel -a 2>/dev/null || true
+            success "All print jobs cancelled."
+            ;;
+
+        *)
+            error "Unknown printer action: $action"
+            echo "  Run 'printbot printer --help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+# ── migrate ───────────────────────────────────────────────────────
+
 cmd_migrate() {
+    if _wants_help "$@"; then
+        echo "Usage: sudo printbot migrate"
+        echo ""
+        echo "Manually run pending version migrations."
+        echo "Normally this runs automatically during 'printbot update'."
+        echo ""
+        echo "Migrations may prompt for new config values when upgrading"
+        echo "to a version that introduces new features."
+        return 0
+    fi
+
     _require_root
     _require_installed
 
     _run_migrations
 }
 
+# ── version ───────────────────────────────────────────────────────
+
 cmd_version() {
+    if _wants_help "$@"; then
+        echo "Usage: printbot version"
+        echo ""
+        echo "Show printbot version and git commit info."
+        return 0
+    fi
+
     echo "printbot v$VERSION"
     if [ -d "$BOT_DIR/.git" ]; then
         local commit
@@ -632,40 +1316,56 @@ cmd_version() {
     fi
 }
 
+# ── help ──────────────────────────────────────────────────────────
+
 cmd_help() {
-    echo -e "${BOLD}printbot${NC} — Telegram Printer Bot CLI"
+    echo -e "${BOLD}printbot${NC} v${VERSION} — Telegram Printer Bot CLI"
     echo ""
-    echo -e "${BOLD}Setup:${NC}"
-    echo "  install          Install PrinterBot (first time setup)"
-    echo "  update           Pull latest code, update deps, restart"
-    echo "  uninstall        Remove service and venv (keeps .env and code)"
-    echo "  migrate          Run pending migrations manually"
+    echo -e "${BOLD}Setup${NC}"
+    echo "  install             Fresh install (system packages, CUPS, Python, service)"
+    echo "  update              Pull latest code, update deps, migrate, restart"
+    echo "  uninstall           Remove service and venv (keeps config and code)"
+    echo "  migrate             Run pending version migrations"
     echo ""
-    echo -e "${BOLD}Service:${NC}"
-    echo "  start            Start the bot"
-    echo "  stop             Stop the bot"
-    echo "  restart          Restart the bot"
-    echo "  status           Show bot status, version, and printer info"
+    echo -e "${BOLD}Service${NC}"
+    echo "  start               Start the bot"
+    echo "  stop                Stop the bot"
+    echo "  restart             Restart the bot"
+    echo "  status              Show status, version, printer info"
     echo ""
-    echo -e "${BOLD}Logs:${NC}"
-    echo "  logs             Show last 50 log lines"
-    echo "  logs -f          Follow logs in real time"
-    echo "  logs 100         Show last N log lines"
+    echo -e "${BOLD}Users${NC}"
+    echo "  user list            List authorized Telegram users"
+    echo "  user add <ID>        Add a user (--name <name>)"
+    echo "  user remove <ID>     Remove a user"
+    echo "  user label <ID> <N>  Set a user's display name"
     echo ""
-    echo -e "${BOLD}Config:${NC}"
-    echo "  config           Show current config (secrets masked)"
-    echo "  config edit      Open .env in editor"
-    echo "  config set K=V   Set a config value"
+    echo -e "${BOLD}Config${NC}"
+    echo "  config               Show all config (secrets masked)"
+    echo "  config get KEY       Get a value"
+    echo "  config set KEY=VAL   Set a value"
+    echo "  config remove KEY    Remove an optional key"
+    echo "  config edit          Open .env in editor"
+    echo "  config keys          List all known keys with descriptions"
     echo ""
-    echo -e "${BOLD}Printer:${NC}"
-    echo "  printer          Show printer status and queue"
-    echo "  printer setup    Run HP printer setup wizard"
+    echo -e "${BOLD}Logs${NC}"
+    echo "  logs                 Last 50 log lines"
+    echo "  logs -f              Follow live logs"
+    echo "  logs <N>             Last N lines"
+    echo "  logs --error         Errors only"
+    echo "  logs --today         Today's logs"
     echo ""
-    echo -e "${BOLD}Other:${NC}"
-    echo "  version          Show version info"
-    echo "  help             Show this help"
+    echo -e "${BOLD}Printer${NC}"
+    echo "  printer              Printer status and queue"
+    echo "  printer setup        HP printer setup wizard"
+    echo "  printer test         Print a test page"
+    echo "  printer cancel       Cancel all print jobs"
     echo ""
-    echo -e "${DIM}Most commands require sudo (service management).${NC}"
+    echo -e "${BOLD}Other${NC}"
+    echo "  version              Version and git info"
+    echo "  help                 This help"
+    echo ""
+    echo -e "${DIM}All commands support --help for detailed usage."
+    echo -e "Commands that modify the system require sudo.${NC}"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -686,6 +1386,7 @@ main() {
         status)     cmd_status "$@" ;;
         logs|log)   cmd_logs "$@" ;;
         config|cfg) cmd_config "$@" ;;
+        user|users) cmd_user "$@" ;;
         printer)    cmd_printer "$@" ;;
         migrate)    cmd_migrate "$@" ;;
         version|-v|--version) cmd_version "$@" ;;

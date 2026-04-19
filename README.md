@@ -70,28 +70,46 @@ sudo printbot update
 
 Pulls latest code from git, updates Python packages, runs migrations (prompts for new config if needed), and restarts the service.
 
+## User Management
+
+Multiple Telegram users can be authorized to use the bot:
+
+```bash
+printbot user list                          # List all authorized users
+sudo printbot user add 123456789 --name Mo  # Add a user with a name
+sudo printbot user add 987654321            # Add without a name
+sudo printbot user remove 987654321         # Revoke access
+sudo printbot user label 123456789 Mohamed  # Set a display name
+```
+
+Get any Telegram user's ID from [@userinfobot](https://t.me/userinfobot).
+
 ## Configuration
 
 ```bash
-printbot config               # Show config (secrets masked)
-sudo printbot config edit     # Open .env in editor
-sudo printbot config set KEY=VALUE  # Set a single value
+printbot config                       # Show all config (secrets masked)
+printbot config get PRINTER_NAME      # Get a specific value
+sudo printbot config set KEY=VALUE    # Set a value
+sudo printbot config remove KEY       # Remove an optional key
+sudo printbot config edit             # Open .env in editor
+printbot config keys                  # List all known keys + descriptions
 ```
 
-Config lives in `.env`:
+Every command supports `--help`:
 
-```env
-TELEGRAM_BOT_TOKEN=your-bot-token
-ALLOWED_USER_IDS=123456789,987654321
-PRINTER_NAME=HP_Smart_Tank_725
-GEMINI_API_KEY=your-gemini-key  # optional, for voice notes
+```bash
+printbot config --help    # Detailed usage + all known config keys
+printbot user --help      # User management help
+printbot logs --help      # Log viewing options
 ```
 
 ## Printer
 
 ```bash
-printbot printer          # Show printer status and queue
-sudo printbot printer setup   # Run HP printer setup wizard
+printbot printer              # Printer status and queue
+sudo printbot printer setup   # HP printer setup wizard
+sudo printbot printer test    # Print a test page
+sudo printbot printer cancel  # Cancel all print jobs
 ```
 
 ## Uninstall
@@ -102,18 +120,46 @@ sudo printbot uninstall   # Removes service and venv, keeps .env and code
 
 ## All Commands
 
+Every command supports `--help` for detailed usage.
+
 ```
-printbot install          First-time setup
-printbot update           Pull, update deps, migrate, restart
-printbot uninstall        Remove service and venv
-printbot start/stop/restart   Service control
-printbot status           Status, version, printer info
-printbot logs [-f] [N]    View logs
-printbot config [show|edit|set]   Manage .env
-printbot printer [setup]  Printer info or setup wizard
-printbot migrate          Run pending migrations
-printbot version          Show version
-printbot help             Show all commands
+Setup:
+  install                  Fresh install
+  update                   Pull, update deps, migrate, restart
+  uninstall                Remove service and venv
+  migrate                  Run pending version migrations
+
+Service:
+  start / stop / restart   Service control
+  status                   Status, version, printer, update check
+
+Users:
+  user list                List authorized users
+  user add <ID> [--name]   Authorize a user
+  user remove <ID>         Revoke access
+  user label <ID> <name>   Set display name
+
+Config:
+  config                   Show config (secrets masked)
+  config get/set/remove    Read, write, delete keys
+  config edit              Open .env in editor
+  config keys              List all known keys
+
+Logs:
+  logs                     Last 50 lines
+  logs -f                  Follow live
+  logs <N>                 Last N lines
+  logs --error / --today   Filtered views
+
+Printer:
+  printer                  Status and queue
+  printer setup            HP setup wizard
+  printer test             Test page
+  printer cancel           Cancel all jobs
+
+Other:
+  version                  Version + git info
+  help                     All commands
 ```
 
 ## How It Works
