@@ -10,7 +10,7 @@ ALLOWED_USER_IDS: set[int] = {
     int(uid.strip()) for uid in os.environ["ALLOWED_USER_IDS"].split(",")
 }
 PRINTER_NAME: str = os.getenv("PRINTER_NAME", "HP_Smart_Tank_725")
-TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", "/tmp/printer_bot"))
+TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", "/tmp/printbot"))
 CUPS_POLL_INTERVAL: int = int(os.getenv("CUPS_POLL_INTERVAL", "3"))
 
 # Gemini (optional — voice features disabled if not set)

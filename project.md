@@ -1,4 +1,4 @@
-# Printer Bot
+# PrintBot
 
 A Telegram bot that receives documents and images, then prints them on a connected printer.
 
@@ -33,7 +33,7 @@ Everything is buttons. No typing except /start and sending files.
 ### Starting the Bot
 ```
 User:  /start
-Bot:   Welcome to PrinterBot!
+Bot:   Welcome to PrintBot!
        Just send me a file or photo and I'll print it.
 
        Supported: PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP
@@ -268,7 +268,7 @@ That's it. Everything else is buttons.
 ## Project Structure
 
 ```
-printer_bot/
+printbot/
   bot.py          # Entry point, Telegram handlers
   printer.py      # CUPS printing logic
   converter.py    # Document-to-PDF conversion

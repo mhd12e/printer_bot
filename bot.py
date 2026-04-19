@@ -83,7 +83,7 @@ async def cmd_start(
     context.user_data.pop("voice_instruction", None)
 
     lines = [
-        "Welcome to PrinterBot!",
+        "Welcome to PrintBot!",
         "",
         "Send me a file or photo and I'll print it.",
     ]
@@ -1662,7 +1662,7 @@ async def handle_main_back(
     await query.answer()
 
     lines = [
-        "Welcome to PrinterBot!",
+        "Welcome to PrintBot!",
         "",
         "Send me a file or photo and I'll print it.",
     ]

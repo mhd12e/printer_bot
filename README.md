@@ -1,4 +1,4 @@
-# PrinterBot
+# PrintBot
 
 A Telegram bot that prints documents and images from your phone to a USB printer. Send a file, pick your settings with buttons, and it prints. That's it.
 
@@ -42,8 +42,8 @@ The bot tells you when:
 ### Install
 
 ```bash
-git clone https://github.com/mhd12e/printer_bot.git
-cd printer_bot
+git clone https://github.com/mhd12e/printbot.git
+cd printbot
 sudo ./printbot install
 ```
 

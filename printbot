@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════
-# printbot — CLI tool for managing PrinterBot
+# printbot — CLI tool for managing PrintBot
 # ═══════════════════════════════════════════════════════════════════
 
 VERSION="3.0.0"
@@ -55,7 +55,7 @@ _is_running() {
 
 _require_installed() {
     if ! _is_installed; then
-        error "PrinterBot is not installed."
+        error "PrintBot is not installed."
         echo "  Run: sudo printbot install"
         exit 1
     fi
@@ -143,7 +143,7 @@ _CONFIG_DESC=(
     "CUPS printer name (see: lpstat -p)"
     "Google Gemini API key for voice notes (https://aistudio.google.com/apikey)"
     "Seconds between CUPS status polls (default: 3)"
-    "Temp file directory (default: /tmp/printer_bot)"
+    "Temp file directory (default: /tmp/printbot)"
 )
 _CONFIG_DEFAULT=(
     ""
@@ -151,7 +151,7 @@ _CONFIG_DEFAULT=(
     ""
     ""
     "3"
-    "/tmp/printer_bot"
+    "/tmp/printbot"
 )
 
 _config_index() {
@@ -287,7 +287,7 @@ _install_service() {
 
     sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<SERVICEEOF
 [Unit]
-Description=Telegram Printer Bot
+Description=Telegram PrintBot
 After=network-online.target cups.service
 Wants=network-online.target cups.service
 
@@ -304,7 +304,7 @@ EnvironmentFile=$ENV_FILE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/tmp/printer_bot $BOT_DIR
+ReadWritePaths=/tmp/printbot $BOT_DIR
 PrivateTmp=false
 
 [Install]
@@ -346,14 +346,14 @@ cmd_install() {
     _require_root
 
     if _is_installed; then
-        error "PrinterBot is already installed."
+        error "PrintBot is already installed."
         echo ""
         echo "  To update:    sudo printbot update"
         echo "  To reinstall: sudo printbot uninstall && sudo printbot install"
         exit 1
     fi
 
-    echo -e "${BOLD}PrinterBot Installer${NC}"
+    echo -e "${BOLD}PrintBot Installer${NC}"
     echo ""
 
     step 1 7 "Installing system packages..."
@@ -439,7 +439,7 @@ cmd_install() {
     success ".env created."
 
     step 6 7 "Creating temp directory..."
-    mkdir -p /tmp/printer_bot
+    mkdir -p /tmp/printbot
     success "Done."
 
     step 7 7 "Installing service and CLI..."
@@ -474,7 +474,7 @@ cmd_update() {
     _require_root
     _require_installed
 
-    echo -e "${BOLD}Updating PrinterBot...${NC}"
+    echo -e "${BOLD}Updating PrintBot...${NC}"
     echo ""
 
     if [ -d "$BOT_DIR/.git" ]; then
@@ -530,7 +530,7 @@ cmd_uninstall() {
     _require_root
     _require_installed
 
-    echo -e "${BOLD}Uninstalling PrinterBot...${NC}"
+    echo -e "${BOLD}Uninstalling PrintBot...${NC}"
     echo ""
     read -rp "  Are you sure? This stops the bot and removes the service. (y/N): " CONFIRM
     if [[ "${CONFIRM,,}" != "y" ]]; then
@@ -566,7 +566,7 @@ cmd_start() {
     if _wants_help "$@"; then
         echo "Usage: sudo printbot start"
         echo ""
-        echo "Start the PrinterBot service."
+        echo "Start the PrintBot service."
         return 0
     fi
 
@@ -586,7 +586,7 @@ cmd_stop() {
     if _wants_help "$@"; then
         echo "Usage: sudo printbot stop"
         echo ""
-        echo "Stop the PrinterBot service. It will not restart until"
+        echo "Stop the PrintBot service. It will not restart until"
         echo "you run 'printbot start' or reboot (auto-start is kept)."
         return 0
     fi
@@ -607,7 +607,7 @@ cmd_restart() {
     if _wants_help "$@"; then
         echo "Usage: sudo printbot restart"
         echo ""
-        echo "Restart the PrinterBot service. Use after config changes."
+        echo "Restart the PrintBot service. Use after config changes."
         return 0
     fi
 
@@ -632,7 +632,7 @@ cmd_status() {
 
     _require_installed
 
-    echo -e "${BOLD}PrinterBot Status${NC}"
+    echo -e "${BOLD}PrintBot Status${NC}"
     echo ""
 
     if _is_running; then
@@ -1319,7 +1319,7 @@ cmd_version() {
 # ── help ──────────────────────────────────────────────────────────
 
 cmd_help() {
-    echo -e "${BOLD}printbot${NC} v${VERSION} — Telegram Printer Bot CLI"
+    echo -e "${BOLD}printbot${NC} v${VERSION} — Telegram PrintBot CLI"
     echo ""
     echo -e "${BOLD}Setup${NC}"
     echo "  install             Fresh install (system packages, CUPS, Python, service)"

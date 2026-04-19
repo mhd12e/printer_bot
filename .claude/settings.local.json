@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(git remote:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "WebSearch",
+      "WebFetch(domain:www.cups.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(rpm -q hplip)",
+      "Bash(rpm -q cups)",
+      "Bash(pip3 show:*)",
+      "Bash(chmod +x:*)",
+      "Bash(bash -n setup.sh)",
+      "Bash(python3 -m py_compile config.py)",
+      "Bash(python3 -m py_compile converter.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('printer.py'\\).read\\(\\)\\); print\\('printer.py OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('bot.py'\\).read\\(\\)\\); print\\('bot.py OK'\\)\")",
+      "Bash(bash -n /home/mhd12/playground/printer_bot/setup.sh)",
+      "Bash(python3:*)",
+      "WebFetch(domain:ai.google.dev)",
+      "Bash(bash -n /home/mhd12/playground/printer_bot/printbot)",
+      "Bash(git rm:*)",
+      "Bash(bash -n printbot)",
+      "Bash(git:*)"
+    ]
+  }
+}
