@@ -82,23 +82,33 @@ async def cmd_start(
     context.user_data.pop("batch", None)
     context.user_data.pop("voice_instruction", None)
 
+    lines = [
+        "Welcome to PrinterBot!",
+        "",
+        "Send me a file or photo and I'll print it.",
+    ]
+    if config.GEMINI_API_KEY:
+        lines.append("You can also send a voice note with instructions.")
+    lines += [
+        "",
+        "Supported formats:",
+        "PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP",
+    ]
+
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Printer Status", callback_data="main:status"
+                    "\U0001f5a8 Printer Status", callback_data="main:status"
                 ),
                 InlineKeyboardButton(
-                    "Print Queue", callback_data="main:queue"
+                    "\U0001f4cb Print Queue", callback_data="main:queue"
                 ),
             ]
         ]
     )
     await update.message.reply_text(
-        "Welcome to PrinterBot!\n"
-        "Just send me a file or photo and I'll print it.\n"
-        "You can also send a voice note with print instructions.\n\n"
-        "Supported: PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP",
+        "\n".join(lines),
         reply_markup=keyboard,
     )
     return ConversationHandler.END
@@ -163,13 +173,24 @@ def build_settings_screen(
     name = job["original_name"]
 
     if job["is_image"]:
-        header = f"{name} \u2014 image"
+        header = f"\U0001f5bc {name} \u2014 image"
     elif job["page_count"]:
-        header = f"{name} \u2014 {job['page_count']} pages"
+        header = f"\U0001f4c4 {name} \u2014 {job['page_count']} pages"
     else:
-        header = name
+        header = f"\U0001f4c4 {name}"
 
-    text = f"{header}\nReady to print. Choose your settings:"
+    # Build labeled text
+    lines = [header, ""]
+    lines.append("Color:")
+    if not job["is_image"]:
+        lines.append("Sides:")
+    lines.append("Orientation:")
+    lines.append("Per sheet:")
+    if not job["is_image"]:
+        lines.append("Pages:")
+    lines.append(f"Copies: {s['copies']}")
+
+    text = "\n".join(lines)
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -237,7 +258,7 @@ def build_settings_screen(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "\u2713 All", callback_data="set:page_range:all"
+                        "\u2713 All pages", callback_data="set:page_range:all"
                     ),
                     InlineKeyboardButton(
                         "Custom\u2026", callback_data="pr:custom"
@@ -248,10 +269,10 @@ def build_settings_screen(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        "All", callback_data="set:page_range:all"
+                        "All pages", callback_data="set:page_range:all"
                     ),
                     InlineKeyboardButton(
-                        f"\u2713 Pages: {s['page_range']}",
+                        f"\u2713 {s['page_range']}",
                         callback_data="pr:custom",
                     ),
                 ]
@@ -261,7 +282,7 @@ def build_settings_screen(
     rows.append(
         [
             InlineKeyboardButton("\u2212", callback_data="set:copies:dec"),
-            InlineKeyboardButton(str(s["copies"]), callback_data="noop"),
+            InlineKeyboardButton(f"  {s['copies']}  ", callback_data="noop"),
             InlineKeyboardButton("+", callback_data="set:copies:inc"),
         ]
     )
@@ -272,7 +293,9 @@ def build_settings_screen(
             InlineKeyboardButton(
                 "\U0001f5a8 Print", callback_data="act:print"
             ),
-            InlineKeyboardButton("Cancel", callback_data="act:cancel"),
+            InlineKeyboardButton(
+                "\u2716 Cancel", callback_data="act:cancel"
+            ),
         ]
     )
 
@@ -303,18 +326,27 @@ def _build_settings_summary(settings: dict, is_image: bool = False) -> str:
     return " | ".join(parts)
 
 
+def _build_collecting_message(batch: dict) -> str:
+    """Build the batch collecting status message."""
+    files = batch["files"]
+    n = len(files)
+    file_list = _build_batch_file_list(files)
+    return f"\U0001f4e5 {n} file{'s' if n != 1 else ''} received:\n{file_list}\n\nSend more or tap Continue."
+
+
 def _build_batch_file_list(files: list[dict]) -> str:
     """Build numbered file list for batch screen header."""
     lines = []
     for i, f in enumerate(files, 1):
+        icon = "\U0001f5bc" if f["is_image"] else "\U0001f4c4"
         if f["is_image"]:
-            lines.append(f"  {i}. {f['original_name']} (image)")
+            lines.append(f"  {icon} {f['original_name']}")
         elif f["page_count"]:
             lines.append(
-                f"  {i}. {f['original_name']} ({f['page_count']} pages)"
+                f"  {icon} {f['original_name']} ({f['page_count']}p)"
             )
         else:
-            lines.append(f"  {i}. {f['original_name']}")
+            lines.append(f"  {icon} {f['original_name']}")
     return "\n".join(lines)
 
 
@@ -327,8 +359,8 @@ def build_batch_settings_screen(
     has_docs = batch["has_documents"]
 
     file_count = len(files)
-    header = f"{file_count} files ready to print:\n{_build_batch_file_list(files)}"
-    text = f"{header}\n\nGlobal settings (apply to all):"
+    header = f"\U0001f4e8 {file_count} files ready to print:\n{_build_batch_file_list(files)}"
+    text = f"{header}\n\nSettings (apply to all):"
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -420,7 +452,7 @@ def build_batch_settings_screen(
                 f"\U0001f5a8 Print All ({file_count})",
                 callback_data="bact:print",
             ),
-            InlineKeyboardButton("Cancel", callback_data="bact:cancel"),
+            InlineKeyboardButton("\u2716 Cancel", callback_data="bact:cancel"),
         ]
     )
 
@@ -648,8 +680,27 @@ async def _process_voice(
     finally:
         converter.cleanup_temp_files(local_path)
 
-    # Build response
-    response = f'I heard: "{parsed.transcript}"'
+    # Build response showing what was understood
+    response = f'\U0001f399 "{parsed.transcript}"'
+
+    # Show extracted settings
+    extracted = []
+    if parsed.color:
+        extracted.append("Color" if parsed.color == "color" else "B&W")
+    if parsed.sides:
+        extracted.append({"one": "One-sided", "long": "Both sides", "short": "Both sides (short)"}[parsed.sides])
+    if parsed.orientation:
+        extracted.append(parsed.orientation.title())
+    if parsed.nup and parsed.nup != 1:
+        extracted.append(f"{parsed.nup} per sheet")
+    if parsed.copies and parsed.copies != 1:
+        extracted.append(f"{parsed.copies} copies")
+    if parsed.page_range:
+        extracted.append(f"Pages: {parsed.page_range}")
+
+    if extracted:
+        response += f"\n\nSettings: {', '.join(extracted)}"
+
     if parsed.clarification:
         response += f"\n\n{parsed.clarification}"
 
@@ -709,14 +760,14 @@ async def handle_document(
             [
                 [
                     InlineKeyboardButton(
-                        f"Continue ({n} files)",
+                        f"\u27a1 Continue ({n} files)",
                         callback_data="batch:done",
                     )
                 ]
             ]
         )
         await msg.edit_text(
-            f"{n} files received. Send more or tap Continue.",
+            _build_collecting_message(batch),
             reply_markup=keyboard,
         )
         batch["status_message_id"] = msg.message_id
@@ -734,13 +785,13 @@ async def handle_document(
         [
             [
                 InlineKeyboardButton(
-                    "Continue (1 file)", callback_data="batch:done"
+                    "\u27a1 Continue (1 file)", callback_data="batch:done"
                 )
             ]
         ]
     )
     await msg.edit_text(
-        f"{file_name} received. Send more files or tap Continue.",
+        _build_collecting_message(context.user_data["batch"]),
         reply_markup=keyboard,
     )
     return BATCH_COLLECTING
@@ -808,13 +859,13 @@ async def handle_photo(
         [
             [
                 InlineKeyboardButton(
-                    "Continue (1 file)", callback_data="batch:done"
+                    "\u27a1 Continue (1 file)", callback_data="batch:done"
                 )
             ]
         ]
     )
     msg = await update.message.reply_text(
-        f"{file_name} received. Send more files or tap Continue.",
+        _build_collecting_message(context.user_data["batch"]),
         reply_markup=keyboard,
     )
     context.user_data["batch"]["status_message_id"] = msg.message_id
@@ -1271,7 +1322,9 @@ async def handle_batch_cancel(
             converter.cleanup_temp_files(*paths)
 
     context.user_data.pop("batch_pr_index", None)
-    await query.edit_message_text("Cancelled.")
+    await query.edit_message_text(
+        "Cancelled. Send another file anytime."
+    )
     return ConversationHandler.END
 
 
@@ -1465,21 +1518,40 @@ async def handle_printer_status(
         await query.edit_message_text(f"Cannot reach printer: {e}")
         return
 
+    online_icon = "\u2705" if status.is_online else "\u274c"
     lines = [
-        f"Printer: {status.name}",
-        f"Status: {status.state}",
-        f"{'Online' if status.is_online else 'OFFLINE'}",
+        f"\U0001f5a8 {status.name}",
+        f"{online_icon} {'Online' if status.is_online else 'OFFLINE'} \u2014 {status.state}",
     ]
     if status.state_message:
-        lines.append(f"Message: {status.state_message}")
+        lines.append(f"{status.state_message}")
 
     if status.ink_levels:
         lines.append("")
-        lines.append("Ink levels:")
         for name, level in status.ink_levels.items():
-            lines.append(f"  {name}: {level}%")
+            if level > 50:
+                bar = "\U0001f7e9"
+            elif level > 15:
+                bar = "\U0001f7e8"
+            else:
+                bar = "\U0001f7e5"
+            lines.append(f"  {bar} {name}: {level}%")
 
-    await query.edit_message_text("\n".join(lines))
+    back_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "\U0001f4cb Print Queue", callback_data="main:queue"
+                ),
+                InlineKeyboardButton(
+                    "\u2b05 Back", callback_data="main:back"
+                ),
+            ]
+        ]
+    )
+    await query.edit_message_text(
+        "\n".join(lines), reply_markup=back_kb
+    )
 
 
 @authorized
@@ -1496,25 +1568,58 @@ async def handle_print_queue(
         return
 
     if not jobs:
-        await query.edit_message_text("Print queue is empty.")
+        back_kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "\U0001f5a8 Printer Status",
+                        callback_data="main:status",
+                    ),
+                    InlineKeyboardButton(
+                        "\u2b05 Back", callback_data="main:back"
+                    ),
+                ]
+            ]
+        )
+        await query.edit_message_text(
+            "\U0001f4cb Print queue is empty.",
+            reply_markup=back_kb,
+        )
         return
 
-    lines = ["Print Queue:"]
+    # State emoji mapping
+    state_icons = {
+        "Queued": "\u23f3",
+        "Printing": "\U0001f504",
+        "Done": "\u2705",
+        "Failed": "\u274c",
+        "Cancelled": "\u2716",
+    }
+
+    lines = ["\U0001f4cb Print Queue:"]
     buttons: list[InlineKeyboardButton] = []
     for j in jobs:
+        icon = state_icons.get(j.state_text, "\u2022")
         lines.append(
-            f"#{j.job_id} \u2014 {j.title} \u2014 {j.state_text}"
+            f"  {icon} #{j.job_id} \u2014 {j.title} \u2014 {j.state_text}"
         )
         buttons.append(
             InlineKeyboardButton(
-                f"Cancel #{j.job_id}",
+                f"\u2716 #{j.job_id}",
                 callback_data=f"q:cancel:{j.job_id}",
             )
         )
 
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     rows.append(
-        [InlineKeyboardButton("Cancel All", callback_data="q:cancelall")]
+        [
+            InlineKeyboardButton(
+                "\u2716 Cancel All", callback_data="q:cancelall"
+            ),
+            InlineKeyboardButton(
+                "\u2b05 Back", callback_data="main:back"
+            ),
+        ]
     )
 
     await query.edit_message_text(
@@ -1547,6 +1652,43 @@ async def handle_cancel_all(
     context.bot_data["active_jobs"] = {}
 
     await query.edit_message_text(f"Cancelled {count} job(s).")
+
+
+async def handle_main_back(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Return to the main welcome screen."""
+    query = update.callback_query
+    await query.answer()
+
+    lines = [
+        "Welcome to PrinterBot!",
+        "",
+        "Send me a file or photo and I'll print it.",
+    ]
+    if config.GEMINI_API_KEY:
+        lines.append("You can also send a voice note with instructions.")
+    lines += [
+        "",
+        "Supported formats:",
+        "PDF, DOCX, PPTX, JPG, PNG, GIF, BMP, TIFF, WEBP",
+    ]
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "\U0001f5a8 Printer Status", callback_data="main:status"
+                ),
+                InlineKeyboardButton(
+                    "\U0001f4cb Print Queue", callback_data="main:queue"
+                ),
+            ]
+        ]
+    )
+    await query.edit_message_text(
+        "\n".join(lines), reply_markup=keyboard
+    )
 
 
 @authorized
@@ -1652,8 +1794,7 @@ async def poll_cups_status(
             try:
                 await context.bot.send_message(
                     info["chat_id"],
-                    f"Job #{job_id} ({info['original_name']}) "
-                    "finished printing.",
+                    f"\u2705 {info['original_name']} printed successfully!",
                 )
             except Exception:
                 pass
@@ -1900,6 +2041,11 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             handle_print_queue, pattern=r"^main:queue$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_main_back, pattern=r"^main:back$"
         )
     )
 
