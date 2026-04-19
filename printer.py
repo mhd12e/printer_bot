@@ -160,10 +160,10 @@ class CupsPrinter:
     def get_all_jobs(self) -> list[PrintJobInfo]:
         """Get all active (not completed/cancelled) jobs."""
         try:
-            jobs = self._conn.getJobs(which="not-completed")
+            jobs = self._conn.getJobs("not-completed")
         except cups.IPPError:
             self._reconnect()
-            jobs = self._conn.getJobs(which="not-completed")
+            jobs = self._conn.getJobs("not-completed")
 
         result = []
         for job_id, attrs in jobs.items():
