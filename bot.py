@@ -969,27 +969,39 @@ async def handle_batch_file(
         await msg.edit_text(f"{file_name}: {result}")
         return BATCH_COLLECTING
 
-    batch = context.user_data["batch"]
-    # Apply global settings to new file
-    result["settings"] = dict(batch["global_settings"])
-    batch["files"].append(result)
-    if not result["is_image"]:
-        batch["has_documents"] = True
+    batch = context.user_data.get("batch")
+
+    if not batch:
+        # No batch yet — start one
+        context.user_data["batch"] = {
+            "files": [result],
+            "global_settings": dict(result["settings"]),
+            "status_message_id": None,
+            "has_documents": not result["is_image"],
+            "has_images": result["is_image"],
+        }
+        batch = context.user_data["batch"]
     else:
-        batch["has_images"] = True
+        result["settings"] = dict(batch["global_settings"])
+        batch["files"].append(result)
+        if not result["is_image"]:
+            batch["has_documents"] = True
+        else:
+            batch["has_images"] = True
 
     n = len(batch["files"])
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    f"Continue ({n} files)", callback_data="batch:done"
+                    f"\u27a1 Continue ({n} file{'s' if n != 1 else ''})",
+                    callback_data="batch:done",
                 )
             ]
         ]
     )
     await msg.edit_text(
-        f"{n} files received. Send more or tap Continue.",
+        _build_collecting_message(batch),
         reply_markup=keyboard,
     )
     batch["status_message_id"] = msg.message_id
@@ -1010,30 +1022,45 @@ async def handle_batch_photo(
     )
     await tg_file.download_to_drive(local_path)
 
-    batch = context.user_data["batch"]
+    batch = context.user_data.get("batch")
     file_info = {
         "file_path": local_path,
         "pdf_path": None,
         "original_name": file_name,
         "is_image": True,
         "page_count": None,
-        "settings": dict(batch["global_settings"]),
+        "settings": dict(
+            batch["global_settings"] if batch else config.DEFAULT_SETTINGS
+        ),
     }
-    batch["files"].append(file_info)
-    batch["has_images"] = True
+
+    if not batch:
+        # No batch yet — start one
+        context.user_data["batch"] = {
+            "files": [file_info],
+            "global_settings": dict(config.DEFAULT_SETTINGS),
+            "status_message_id": None,
+            "has_documents": False,
+            "has_images": True,
+        }
+        batch = context.user_data["batch"]
+    else:
+        batch["files"].append(file_info)
+        batch["has_images"] = True
 
     n = len(batch["files"])
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    f"Continue ({n} files)", callback_data="batch:done"
+                    f"\u27a1 Continue ({n} file{'s' if n != 1 else ''})",
+                    callback_data="batch:done",
                 )
             ]
         ]
     )
     msg = await update.message.reply_text(
-        f"{n} files received. Send more or tap Continue.",
+        _build_collecting_message(batch),
         reply_markup=keyboard,
     )
     batch["status_message_id"] = msg.message_id
