@@ -121,10 +121,12 @@ class CupsPrinter:
         ]
         options["copies"] = str(settings["copies"])
 
-        # These options only apply to multi-page documents, not images
+        # Pages per sheet (works for both documents and images)
+        options["number-up"] = str(settings["nup"])
+
         if not is_image:
+            # Document-only options
             options["sides"] = SIDES_OPTIONS[settings["sides"]]
-            options["number-up"] = str(settings["nup"])
             if settings["page_range"] != "all":
                 options["page-ranges"] = settings["page_range"]
 

@@ -10,7 +10,7 @@ echo "=== Printer Bot Setup (Ubuntu Server) ==="
 echo "Install directory: $BOT_DIR"
 echo ""
 
-# ── Detect install vs update ──────��───────────────────────────────
+# ── Detect install vs update ──────────────────────────────────────
 if [ -d "$VENV_DIR" ] && [ -f "$BOT_DIR/.env" ]; then
     MODE="update"
     echo "Existing installation detected. Running in UPDATE mode."
@@ -19,6 +19,26 @@ else
     echo "Fresh installation."
 fi
 echo ""
+
+# ── Auto-update from git ─────────────────────────────────────────
+if [ -d "$BOT_DIR/.git" ]; then
+    echo "Checking for updates..."
+    cd "$BOT_DIR"
+    git fetch origin 2>/dev/null || true
+    LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "none")
+    REMOTE=$(git rev-parse origin/main 2>/dev/null || echo "none")
+    if [ "$LOCAL" != "$REMOTE" ] && [ "$REMOTE" != "none" ]; then
+        echo "New version available. Pulling updates..."
+        git pull origin main
+        echo "Updated to latest version."
+        echo ""
+        # Re-exec setup.sh in case it changed
+        exec "$BOT_DIR/setup.sh" "$@"
+    else
+        echo "Already up to date."
+    fi
+    echo ""
+fi
 
 # ── 1. System packages ─────────────────────────��───────────────────
 echo "[1/7] Installing system packages..."

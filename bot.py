@@ -220,19 +220,19 @@ def build_settings_screen(
         ]
     )
 
-    if not job["is_image"]:
-        # Pages per sheet
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    _mark(str(n), s, "nup", n),
-                    callback_data=f"set:nup:{n}",
-                )
-                for n in config.NUP_OPTIONS
-            ]
-        )
+    # Pages per sheet (documents and images)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark(str(n), s, "nup", n),
+                callback_data=f"set:nup:{n}",
+            )
+            for n in config.NUP_OPTIONS
+        ]
+    )
 
-        # Page range
+    if not job["is_image"]:
+        # Page range (documents only)
         if s["page_range"] == "all":
             rows.append(
                 [
@@ -279,21 +279,27 @@ def build_settings_screen(
     return text, InlineKeyboardMarkup(rows)
 
 
-def _build_settings_summary(settings: dict) -> str:
+def _build_settings_summary(settings: dict, is_image: bool = False) -> str:
     parts = [
         "Color" if settings["color"] == "color" else "B\u200a&\u200aW",
-        {
-            "one": "One-sided",
-            "long": "Long edge",
-            "short": "Short edge",
-        }[settings["sides"]],
-        settings["orientation"].title(),
-        f"{settings['nup']}/sheet",
-        f"Pages: {settings['page_range']}",
+    ]
+    if not is_image:
+        parts.append(
+            {
+                "one": "One-sided",
+                "long": "Long edge",
+                "short": "Short edge",
+            }[settings["sides"]]
+        )
+    parts.append(settings["orientation"].title())
+    parts.append(f"{settings['nup']}/sheet")
+    if not is_image:
+        parts.append(f"Pages: {settings['page_range']}")
+    parts.append(
         f"{settings['copies']} copy"
         if settings["copies"] == 1
-        else f"{settings['copies']} copies",
-    ]
+        else f"{settings['copies']} copies"
+    )
     return " | ".join(parts)
 
 
@@ -373,15 +379,14 @@ def build_batch_settings_screen(
         ]
     )
 
-    if has_docs:
-        # Pages per sheet
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    _mark(str(n), s, "nup", n),
-                    callback_data=f"bset:nup:{n}",
-                )
-                for n in config.NUP_OPTIONS
+    # Pages per sheet (documents and images)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark(str(n), s, "nup", n),
+                callback_data=f"bset:nup:{n}",
+            )
+            for n in config.NUP_OPTIONS
             ]
         )
 
@@ -487,17 +492,18 @@ def build_batch_file_settings_screen(
         ]
     )
 
-    if not f["is_image"]:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    _mark(str(n), s, "nup", n),
-                    callback_data=f"{prefix}:nup:{n}",
-                )
-                for n in config.NUP_OPTIONS
-            ]
-        )
+    # Pages per sheet (documents and images)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                _mark(str(n), s, "nup", n),
+                callback_data=f"{prefix}:nup:{n}",
+            )
+            for n in config.NUP_OPTIONS
+        ]
+    )
 
+    if not f["is_image"]:
         if s["page_range"] == "all":
             rows.append(
                 [
@@ -1227,7 +1233,7 @@ async def handle_batch_print(
             continue
 
         lines.append(f"#{job_id} \u2014 {f['original_name']}")
-        summary = _build_settings_summary(f["settings"])
+        summary = _build_settings_summary(f["settings"], is_image=f.get("is_image", False))
 
         context.bot_data.setdefault("active_jobs", {})[job_id] = {
             "chat_id": update.effective_chat.id,
@@ -1373,7 +1379,7 @@ async def handle_print(
         await query.edit_message_text("File is empty or missing.")
         return ConversationHandler.END
 
-    summary = _build_settings_summary(job["settings"])
+    summary = _build_settings_summary(job["settings"], is_image=job.get("is_image", False))
 
     try:
         job_id = await printer.async_submit_job(
