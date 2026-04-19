@@ -67,10 +67,10 @@ _PARSE_SCHEMA = types.Schema(
             description="Page orientation. null if not mentioned.",
         ),
         "nup": types.Schema(
-            type=types.Type.INTEGER,
+            type=types.Type.STRING,
             nullable=True,
-            enum=[1, 2, 4, 6, 9],
-            description="Pages per sheet. null if not mentioned.",
+            enum=["1", "2", "4", "6", "9"],
+            description="Pages per sheet as string. null if not mentioned.",
         ),
         "page_range": types.Schema(
             type=types.Type.STRING,
@@ -78,9 +78,9 @@ _PARSE_SCHEMA = types.Schema(
             description="Page range like '1-3,5' or 'all'. null if not mentioned.",
         ),
         "copies": types.Schema(
-            type=types.Type.INTEGER,
+            type=types.Type.STRING,
             nullable=True,
-            description="Number of copies (1-99). null if not mentioned.",
+            description="Number of copies as string (1-99). null if not mentioned.",
         ),
         "clarification": types.Schema(
             type=types.Type.STRING,
@@ -152,13 +152,20 @@ async def parse_print_instruction(transcript: str) -> ParsedInstruction:
 
     data = json.loads(response.text)
 
+    # Convert string numbers back to int
+    nup_raw = data.get("nup")
+    nup_val = int(nup_raw) if nup_raw is not None else None
+
+    copies_raw = data.get("copies")
+    copies_val = int(copies_raw) if copies_raw is not None else None
+
     return ParsedInstruction(
         color=data.get("color"),
         sides=data.get("sides"),
         orientation=data.get("orientation"),
-        nup=data.get("nup"),
+        nup=nup_val,
         page_range=data.get("page_range"),
-        copies=data.get("copies"),
+        copies=copies_val,
         clarification=data.get("clarification"),
         transcript=transcript,
     )
